@@ -112,6 +112,11 @@ pub struct RepoCredential {
     pub username: String,
     pub password: String,
     pub expires_at: String,
+    /// Why the remote serves this repo's tracker narrower than its
+    /// definition says, when it does (a fork held to its upstream's
+    /// audience): said on a write, so the writer learns who will read it.
+    #[serde(default)]
+    pub capped: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -293,7 +298,6 @@ pub trait Remote: Send + Sync {
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
         uploaded: bool,
-        instance: Option<&str>,
     ) -> Result<BegunMerge>;
     /// Send `pack`, holding `commit` and what `tracker`'s repo lacks of it,
     /// before a merge begins: the remote pushes it to `commit`'s landing ref
@@ -830,13 +834,8 @@ impl Remote for HttpRemote {
         base: &std::collections::BTreeMap<String, String>,
         list: &std::collections::BTreeMap<String, String>,
         uploaded: bool,
-        instance: Option<&str>,
     ) -> Result<BegunMerge> {
-        let mut body = serde_json::json!({ "base": base, "list": list, "uploaded": uploaded });
-        // So the landing marks the instance's pull request merged.
-        if let Some(instance) = instance {
-            body["instance"] = serde_json::json!(instance);
-        }
+        let body = serde_json::json!({ "base": base, "list": list, "uploaded": uploaded });
         let started: BegunMerge = self.send_checked(
             "POST",
             &format!(
@@ -1322,11 +1321,19 @@ fn read_auth(path: &Utf8Path) -> Result<AuthFile> {
 }
 
 /// Write a secret: created owner-only, never readable by anyone else.
+/// Staged under a name no other writer uses (this process, and a counter
+/// within it) and renamed into place, so writers running at once never
+/// truncate or move each other's staging file: each rename lands whole.
 pub fn write_private(path: &Utf8Path, contents: &str) -> Result<()> {
+    static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
     }
-    let staging = path.with_extension("tmp");
+    let staging = Utf8PathBuf::from(format!(
+        "{path}.{}.{}.tmp",
+        std::process::id(),
+        STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     {
         use std::io::Write as _;
         let mut options = std::fs::OpenOptions::new();
@@ -1342,7 +1349,10 @@ pub fn write_private(path: &Utf8Path, contents: &str) -> Result<()> {
         file.write_all(contents.as_bytes())
             .map_err(|source| NewgitError::io(&staging, source))?;
     }
-    std::fs::rename(&staging, path).map_err(|source| NewgitError::io(path, source))
+    std::fs::rename(&staging, path).map_err(|source| {
+        let _ = std::fs::remove_file(&staging);
+        NewgitError::io(path, source)
+    })
 }
 
 /// Where a workspace keeps its own token: inside `.git/`, so it is never
@@ -1385,6 +1395,28 @@ pub struct RemoteState {
     pub pulls: Vec<PullState>,
     #[serde(default)]
     pub ended: Vec<PullEnded>,
+    /// How each export target's mirror stands, from a remote that exports
+    /// (`newgit serve`); none from one that leaves exports to the client.
+    #[serde(default)]
+    pub exports: Vec<ExportState>,
+}
+
+/// One export target's mirror, as the remote that pushes it says.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportState {
+    pub target: String,
+    /// `up to date`, `behind`, or `failing`.
+    pub state: String,
+    /// Landings on the project since its last export finished.
+    #[serde(default)]
+    pub behind: u64,
+    #[serde(default)]
+    pub failures: u32,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub retry_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1445,6 +1477,10 @@ pub struct PullEnded {
     pub outcome: String,
     pub why: Option<String>,
     pub at: String,
+    /// The tag it was the pull of, for a tag made on the mirror: a pull of
+    /// its own, beside the pull of the commit it names.
+    #[serde(default)]
+    pub tag: Option<String>,
 }
 
 impl RemoteState {
@@ -1534,10 +1570,44 @@ impl RemoteState {
         for ended in &self.ended {
             let since = troubles.entry(ended.target.as_str()).or_default();
             if ended.outcome == "refused" || ended.outcome == "gave up" {
-                since.retain(|earlier| earlier.commit != ended.commit);
+                since.retain(|earlier| earlier.commit != ended.commit || earlier.tag != ended.tag);
                 since.push(ended);
             } else {
                 since.clear();
+            }
+        }
+        for export in &self.exports {
+            let landings = if export.behind == 1 {
+                "landing"
+            } else {
+                "landings"
+            };
+            match export.state.as_str() {
+                "failing" => {
+                    let mut note = format!(
+                        "the export to `{}` is failing ({} {}): {}",
+                        export.target,
+                        export.failures,
+                        if export.failures == 1 {
+                            "attempt"
+                        } else {
+                            "attempts"
+                        },
+                        export.last_error.as_deref().unwrap_or("no reason given")
+                    );
+                    if export.behind > 0 {
+                        note.push_str(&format!("; it is {} {landings} behind", export.behind));
+                    }
+                    if let Some(at) = &export.retry_at {
+                        note.push_str(&format!("; tried again at {at}"));
+                    }
+                    notes.push(note);
+                }
+                "behind" => notes.push(format!(
+                    "the export to `{}` is {} {landings} behind (exporting)",
+                    export.target, export.behind
+                )),
+                _ => {}
             }
         }
         for ended in troubles.values().flatten() {
@@ -1572,10 +1642,10 @@ pub struct LandedMerge {
     /// None from a remote that does not say.
     #[serde(default)]
     pub anchor: Option<String>,
-    /// The pull request the landing marked merged, from a remote that has
-    /// them.
+    /// The branch had moved since the merge's base, and the remote merged
+    /// onto what it is now: what landed is not the merge's own index.
     #[serde(default)]
-    pub pull: Option<u64>,
+    pub merged: bool,
 }
 
 /// Where a merge's commit waits in a tracker's repo until the remote lands
@@ -1742,7 +1812,7 @@ pub enum Acting<'a> {
     Workspace(&'a Utf8Path),
 }
 
-type Connect = dyn Fn(Acting<'_>) -> Result<Box<dyn Remote>>;
+type Connect = dyn Fn(Acting<'_>) -> Result<Box<dyn Remote>> + Send + Sync;
 
 /// A project's link to its remote: which project, where, and how to get a
 /// client acting as someone. Tests build one over a fake [`Remote`].
@@ -1765,7 +1835,7 @@ impl RemoteLink {
     pub fn new(
         project: impl Into<String>,
         url: impl Into<String>,
-        connect: impl Fn(Acting<'_>) -> Result<Box<dyn Remote>> + 'static,
+        connect: impl Fn(Acting<'_>) -> Result<Box<dyn Remote>> + Send + Sync + 'static,
     ) -> Self {
         Self {
             project: project.into(),

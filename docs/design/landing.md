@@ -1,6 +1,7 @@
 # Landing
 
-**Status: decided, not built.** How changes land in a tree of trackers on
+**Status: decided; steps 1 to 4 of the build order are built, and the
+mirrors (#414).** How changes land in a tree of trackers on
 `newgit serve`. It replaces [anchoring.md](anchoring.md), which describes how
 the Worker on newgit.dev lands merges today and goes when newgit.dev moves to
 `serve`. Settled with Jack on 2026-11-10 after two adversarial reviews and a
@@ -80,7 +81,8 @@ state.
   reveals that a hidden commit exists, and a crafted push can point a ref at
   any object in the store. A check in front of upload-pack can't close all
   three without reimplementing Git's authorization, which would be
-  simulating security. An embargoed branch gets a store of its own.
+  simulating security. An embargoed branch gets a store of its own. Built
+  (#409): [serve.md](serve.md), *The shape* and decision 1.
 - **Mounts** say how a tracker sits in its parent, the same for every tracker:
 
   | Mount | The child's head | The parent records | Example |
@@ -108,7 +110,9 @@ On one server:
    server shard; its sequence number is the landing stamp. Repo refs and
    SQLite follow it and are repaired from it at startup, and readers resolve
    heads through it, so no reader sees half a landing. "State at T" reads
-   the stamps, never commit dates.
+   the stamps, never commit dates. A tracker moving between stores is part
+   of its landing's entry, put in place after the commit point. Built
+   (#410): [serve.md](serve.md), decision 8.
 5. **Barriers:** a change under `.newgit/trackers/` (definitions, audiences,
    mounts) lands only on the current head, by itself, and bumps an epoch. A
    landing prepared under an older epoch starts again.
@@ -120,15 +124,41 @@ On one server:
 8. A directory renamed by a landing reruns the merge of any landing prepared
    before it, so a file added under the old name follows the rename.
 
+Items 1–3, 5, 6 and 8 are built (#411): [serve.md](serve.md), decision 9.
+The recheck is by path, as item 3 says: a landing in between that changed
+other paths costs only re-making the commits that record pins (root, and
+each tracker both moved along the mount chain) on the new head, in
+process, with no `merge-tree`; the same holds for a merge's first attempt
+when what landed since its base changed other paths. A directory another
+landing deleted or renamed overlaps every path under it (item 8), and a
+landing that empties a tracker, adds or drops one, or changes a definition
+reruns every merge prepared before it, since its whole directory in the
+view may have moved. A Git merge composes each tracker commit's view once
+per finish (#440): the base, the head, and the merger's index share most of
+their trackers, and an attempt that runs again composes only what landed
+since. Split reuses the same views, so a tracker whose part of the merge is
+its view on either side keeps that side's commit without composing it
+again. Item 7's strict merge queue is not built.
+
 Across servers there is no transaction: two landings, in order (rule 5).
 
 ## Secrets and trackers outside Git
 
 Unchanged in shape: their own history, never in the workspace's `.git`, never
 in a view, never exported. On `serve` they are **encrypted to their audience**
-(#338) with age and the members' GitHub SSH keys, so the server stores
-ciphertext and holds no key. They merge on the client, which can decrypt;
-the server still checks ancestry and moves refs in the same landing
+(#338) with age and the members' GitHub SSH keys, unless `public` (built: see
+the reference's *Encrypted trackers*). The server stores ciphertext and
+cannot read it, but it is still trusted for four things: it keeps the
+member list, so it could add a login whose keys then become recipients
+(every change to the set is printed by fingerprint); it serves the tracker
+definitions, which decide whether a path is encrypted at all (a machine that
+has held a path's encrypted content refuses to store it unencrypted until
+`newgit tracker allow-plaintext <path>` there, a confirmation rather than a
+boundary that knows paths, not content; a machine that never held it has
+nothing to compare against);
+nothing is signed, so it could substitute content that decrypts cleanly
+(#431); and names, sizes, and commit metadata stay readable to it. They merge on the client, which can
+decrypt; the server still checks ancestry and moves refs in the same landing
 transaction. A checkpoint records their revisions in the binding record, not
 as Git parents, so no shared store references a private commit.
 
@@ -148,7 +178,8 @@ Mac, relative numbers):
 - Spawning one package rooted at it: 0.13 s and 22 KB from the pool, the
   same as a repo of its own. Without a stored rooted history, a partial
   clone of one package took 99 s and 1.6 GB, so **each tracker's rooted
-  history is always stored**, never computed per fetch.
+  history is always stored**, never computed per fetch. Built (#412):
+  [serve.md](serve.md), decision 10, with what it costs on `serve`.
 - Landings: about 380 per second batched, against about 290 for one repo
   with stored splits.
 - `git log` on one package: 6–17 ms.
@@ -175,15 +206,36 @@ Anchors as a concept, deferred roll-ups, inboxes and outboxes, reservations,
 
 ## Build order on `newgit serve`
 
-1. Pool per audience: trackers as ref namespaces, refs in reftable, one
-   audience per store enforced at creation.
-2. The landing log and one-transaction landings with group commit; readers
-   resolve heads through it; startup repair.
-3. Server-side merge (compose, `merge-tree`, split) in place of "merge
-   again", with barriers, epochs, and fairness.
-4. Stored rooted histories, extended at landing.
+1. **Done (#409).** Pool per audience: trackers as ref namespaces, refs in
+   reftable, one audience per store enforced at creation.
+2. **Done (#410).** The landing log and one-transaction landings with group
+   commit; readers resolve heads through it; startup repair; store moves
+   as landing steps.
+3. **Done (#411).** Server-side merge in place of "merge again": a
+   fast-forward when the branch did not move; the merger's work re-made on
+   the head, without Git's merge, when what landed since changed other
+   paths; otherwise compose, `merge-tree`, and split, with one merge commit
+   per tracker both sides moved and the merger's commit second. The recheck
+   by path; policy, membership, and the audience rule read against what
+   lands; barriers and epochs on `main`; fairness as a turn on the paths a
+   merge changes. Views composed from subtrees cached by tracker commit
+   (#440), and what a merge asks of Git answered in process (#445).
+4. **Done (#412).** Stored rooted histories: each tracker's view, composed
+   from the trackers its store's readers may all read (its own store's and
+   public ones), kept in its store and extended by composing only what is
+   new. Derived data, never in a landing's entry: extended after each
+   landing in the background, and caught up by any read that finds it
+   behind, so no reader sees one behind what landed. A reader who may read
+   more (a private tracker mounted inside) is still composed for per
+   fetch; caching those by tracker commit, as a server merge's views are
+   (#440), is not done yet. [serve.md](serve.md), decision 10.
 5. Dependencies across servers: ordered two-step landings, proposals, resume.
-6. Encryption of trackers outside Git (#338).
+   (Not a dependency, and done: **mirrors (#414).** The GitHub webhook
+   lands a mirror's commits as a merge, one landing, and each target's
+   view is exported after landings as derived data that may be behind:
+   [serve.md](serve.md), decision 11.)
+6. ~~Encryption of trackers outside Git (#338).~~ Done on the client; the
+   Worker and `serve` move the ciphertext as opaque blobs.
 7. Move newgit.dev from the Worker to `serve`, and delete `anchoring.md`.
 
 ## Open

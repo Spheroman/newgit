@@ -38,10 +38,19 @@ pub struct ResourceDefinition {
     /// cannot tell, so a change that rewrote a rendered file names the
     /// process as possibly stale. Workspace-relative, like `[[render]].path`.
     pub reads: Option<Vec<Utf8PathBuf>>,
+    /// Ignored output this resource's tools refill on their own (Rust's
+    /// `target/`, `.next/cache`): `stop --evict` drops it with the
+    /// workspace and nothing brings it back, since the build fills it again
+    /// lazily. No hook reads it. Workspace-relative, like `[identity]
+    /// produces`, and only ever covers ignored files: anything a checkpoint
+    /// holds is held all the same.
+    pub disposable: Vec<Utf8PathBuf>,
     pub actions: BTreeMap<String, ActionSpec>,
     pub checkpoint: Option<CheckpointSpec>,
     pub restore: Option<RestoreSpec>,
     pub cleanup: Option<CleanupSpec>,
+    /// What "up" means for this resource, when the definition says (#276).
+    pub ready: Option<ReadySpec>,
     /// `sha256:<hex12>` of the definition file contents.
     pub definition_rev: String,
 }
@@ -139,6 +148,40 @@ pub struct ActionSpec {
     pub captures: Vec<String>,
 }
 
+/// What it takes for a resource to count as up (#276): what `spawn`,
+/// `newgit start`, and a dependent's start wait for, and what `status`
+/// shows as `starting` until it holds.
+///
+/// With neither `http` nor `command`, a resource is up when its running
+/// process answers on every port it claims, which is what newgit checked
+/// before there was a `[ready]`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReadySpec {
+    /// Up when a GET of this URL answers 200–399, redirects not followed.
+    /// Rendered like an action command, so `{{ports.<name>}}` works. For a
+    /// server that binds early and serves errors until it has compiled.
+    #[serde(default)]
+    pub http: Option<String>,
+    /// Up when this command exits 0. Rendered and run like an action, with
+    /// the command environment. For what newgit does not supervise: a
+    /// Supabase stack a `prepare` started (`supabase status`).
+    #[serde(default)]
+    pub command: Option<String>,
+    /// How long to wait for it to come up, in whole seconds: at the end of
+    /// `spawn`, and before starting what depends on it. Default 5.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
+/// How long newgit waits for a resource to come up when its definition
+/// does not say.
+pub const DEFAULT_READY_TIMEOUT_SECONDS: u64 = 5;
+
+/// The longest `[ready] timeout_seconds` accepted: an hour. A wait longer
+/// than that is a hang, not a server compiling.
+pub const MAX_READY_TIMEOUT_SECONDS: u64 = 3600;
+
 /// How a resource tears its concrete instance down. Ownership decides
 /// whether the hook may run at all; this decides what running it means.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -222,6 +265,8 @@ struct ResourceDefinitionFile {
     #[serde(default)]
     reads: Option<Vec<Utf8PathBuf>>,
     #[serde(default)]
+    disposable: Vec<Utf8PathBuf>,
+    #[serde(default)]
     actions: BTreeMap<String, ActionSpec>,
     #[serde(default)]
     checkpoint: Option<CheckpointSpec>,
@@ -229,6 +274,8 @@ struct ResourceDefinitionFile {
     restore: Option<RestoreSpec>,
     #[serde(default)]
     cleanup: Option<CleanupSpec>,
+    #[serde(default)]
+    ready: Option<ReadySpec>,
 }
 
 impl ResourceDefinition {
@@ -257,10 +304,12 @@ impl ResourceDefinition {
             exports: file.exports,
             render: file.render,
             reads: file.reads,
+            disposable: file.disposable,
             actions: file.actions,
             checkpoint: file.checkpoint,
             restore: file.restore,
             cleanup: file.cleanup,
+            ready: file.ready,
             definition_rev: format!("sha256:{hex}"),
         };
         definition.validate()?;
@@ -273,6 +322,49 @@ impl ResourceDefinition {
             .get("stop")
             .and_then(|action| action.signal.clone())
             .unwrap_or_else(|| "term".to_owned())
+    }
+
+    /// How long to wait for this resource to come up (`[ready]
+    /// timeout_seconds`, default five seconds).
+    pub fn ready_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.ready
+                .as_ref()
+                .and_then(|ready| ready.timeout_seconds)
+                .unwrap_or(DEFAULT_READY_TIMEOUT_SECONDS),
+        )
+    }
+
+    /// Whether `[ready]` names a check of its own (`http` or `command`)
+    /// rather than leaving "up" to the ports answering.
+    pub fn has_ready_check(&self) -> bool {
+        self.ready
+            .as_ref()
+            .is_some_and(|ready| ready.http.is_some() || ready.command.is_some())
+    }
+
+    /// `sha256:<hex12>` of what `prepare` runs: its command and the
+    /// directory it runs in, as declared. Recorded on a binding when its
+    /// `prepare` runs, so `status` can say when the definition has moved on
+    /// since; a hash of the whole file would also move on a comment or a
+    /// `[ready]` edit, which need nothing done.
+    pub fn prepare_rev(&self) -> String {
+        let action = self.runnable_prepare();
+        let command = action.and_then(|action| action.command.as_deref());
+        let workdir = self.workdir_for(action).map(Utf8Path::as_str);
+        let digest = Sha256::digest(
+            format!(
+                "{}\0{}",
+                command.unwrap_or_default(),
+                workdir.unwrap_or_default()
+            )
+            .as_bytes(),
+        );
+        let hex: String = digest[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("sha256:{hex}")
     }
 
     pub fn has_long_running_action(&self) -> bool {
@@ -422,6 +514,33 @@ impl ResourceDefinition {
 
     fn validate(&self) -> Result<()> {
         self.check_identity_paths()?;
+        if let Some(ready) = &self.ready {
+            if ready.http.is_some() && ready.command.is_some() {
+                return Err(self.invalid(
+                    "`[ready]` takes `http` or `command`, not both: name the one check that \
+                     means this resource is up"
+                        .to_owned(),
+                ));
+            }
+            if let Some(url) = &ready.http
+                && !(url.starts_with("http://") || url.starts_with("https://"))
+            {
+                return Err(self.invalid(format!(
+                    "`[ready] http` must be an `http://` or `https://` URL, got `{url}`"
+                )));
+            }
+            if let Some(seconds) = ready.timeout_seconds
+                && !(1..=MAX_READY_TIMEOUT_SECONDS).contains(&seconds)
+            {
+                return Err(self.invalid(format!(
+                    "`[ready] timeout_seconds` must be between 1 and \
+                     {MAX_READY_TIMEOUT_SECONDS}, got {seconds}"
+                )));
+            }
+        }
+        for path in &self.disposable {
+            self.check_identity_path(path, "`disposable` path")?;
+        }
         if let Some(checkpoint) = &self.checkpoint {
             match checkpoint.mode {
                 CheckpointMode::None => {}
@@ -1282,9 +1401,13 @@ fn resolve_order(
     (walk.ordered, walk.problems)
 }
 
-/// Names newgit sets on every command it runs, after every resource's. A
-/// declaration claiming one of these is dead on arrival.
-const RESERVED_ENV_NAMES: [&str; 3] = ["NEWGIT_BRANCH", "NEWGIT_WORKSPACE", "NEWGIT_LOCKED"];
+/// Every name newgit sets or reads itself starts with this: the ones it
+/// sets on every command it runs, after every resource's (`NEWGIT_BRANCH`,
+/// `NEWGIT_WORKSPACE`, `NEWGIT_LOCKED`), and the ones a newgit run inside
+/// `newgit run` would obey (`NEWGIT_KEYS_URL`, where members' keys come
+/// from; `NEWGIT_IDENTITY`, which key decrypts). A resource export of any of
+/// them is refused: one could point key lookup at keys of its choosing.
+const RESERVED_ENV_PREFIX: &str = "NEWGIT_";
 
 /// Check that no environment variable name is claimed by two declarations.
 ///
@@ -1344,7 +1467,7 @@ pub fn check_env_names(resources: &[ResourceDefinition]) -> Vec<GraphProblem> {
     let mut problems = Vec::new();
     for (name, mut claimants) in claims {
         claimants.sort();
-        if RESERVED_ENV_NAMES.contains(&name) {
+        if name.starts_with(RESERVED_ENV_PREFIX) {
             // Reported per claimant: each one has to be renamed, and a
             // collision between two dead declarations is not the point.
             for claimant in claimants {
@@ -1383,10 +1506,12 @@ mod tests {
             exports: BTreeMap::new(),
             render: Vec::new(),
             reads: None,
+            disposable: Vec::new(),
             actions: BTreeMap::new(),
             checkpoint: None,
             restore: None,
             cleanup: None,
+            ready: None,
             definition_rev: "sha256:000000000000".to_owned(),
         }
     }

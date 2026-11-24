@@ -41,17 +41,35 @@ use crate::supervisor::{ProcessState, StopOutcome, Supervisor, run_captured, run
 use crate::templates::{instantiate, resource_template};
 use crate::tracker::{
     Storage, TrackerDefinition, collect_files, collect_owned_files, content_rev, normalize_path,
-    symlinked_parent,
+    symlinked_parent, tracker_path,
 };
 use crate::tracker_repo::{
     Branch, CaptureAt, TrackerRepo, clear_owned_paths, copy_file, parse_tracker_state_ref,
     pinned_revs, prune_unreferenced,
 };
 
+mod encryption;
+mod evict;
+mod held_ports;
+mod remove;
+mod retention;
+pub use encryption::{Reencrypted, describe_recipients};
+mod definition_problems;
+mod export_check;
+mod pull;
+pub use pull::{PullOutcome, PulledTracker};
+mod reset;
+mod run_logs;
+pub use reset::{HeldBack, ResetLine, ResetOutcome};
+use run_logs::{last_action_log, last_log_line};
 mod pull_request;
 pub use pull_request::PullRequestSpec;
 mod stale_render;
 pub use stale_render::{PossiblyStale, StaleRender};
+mod stale_definition;
+pub use stale_definition::UnboundResource;
+mod target_push;
+use target_push::{Pushing, PutBack};
 
 /// The store remote a workspace's `git push` is forwarded to.
 const PUBLISH_REMOTE: &str = "origin";
@@ -95,6 +113,54 @@ pub struct BranchManager {
     /// the held lock back instead of waiting on its own process; the entry
     /// dies with the last guard.
     locks: Mutex<BTreeMap<String, Weak<InstanceLock>>>,
+    /// Where members' public keys come from, to encrypt trackers outside
+    /// Git to their audience (#338): GitHub, unless replaced.
+    keys: Arc<dyn crate::crypt::KeySource>,
+    /// Each audience's recipients as read from the remote and GitHub in
+    /// this process, so a command reads them once.
+    audiences: Mutex<BTreeMap<String, encryption::Audience>>,
+    /// Why a tracker's rev could not be encrypted again to its audience in
+    /// this command, by tracker: said when the sync then refuses it.
+    reseal_failures: Mutex<BTreeMap<String, String>>,
+    /// What each send would carry ([`crate::tracker_repo::Unsent`]), by
+    /// tracker, rev, what the remote has, and recipients: worked out once
+    /// per command, though a send checks it more than once.
+    unsent: Mutex<BTreeMap<String, BTreeMap<String, crate::tracker_repo::Unsent>>>,
+    /// Forks whose definitions need fixing, as `(tracker, why)`: only a
+    /// manager opened with [`BranchManager::open_to_repair`] has any.
+    fork_problems: Vec<(String, String)>,
+    /// Evicted instances this manager is bringing back right now, by slug:
+    /// the undo that does it needs the workspace every other command is
+    /// refused while the record says `evicted` (see
+    /// [`BranchManager::start_instance`]).
+    restoring: Mutex<BTreeSet<String>>,
+}
+
+/// An instance in [`BranchManager`]'s `restoring` for as long as this lives.
+struct Restoring<'a> {
+    set: &'a Mutex<BTreeSet<String>>,
+    slug: String,
+}
+
+impl<'a> Restoring<'a> {
+    fn new(set: &'a Mutex<BTreeSet<String>>, slug: &str) -> Self {
+        set.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(slug.to_owned());
+        Self {
+            set,
+            slug: slug.to_owned(),
+        }
+    }
+}
+
+impl Drop for Restoring<'_> {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.slug);
+    }
 }
 
 /// An instance's lock as a command holds it; dropping the last guard for an
@@ -290,8 +356,9 @@ pub struct SpawnFromCheckpointOutcome {
     /// after it rather than at the spawn, so the restore does not stop a
     /// process the checkpoint never had running.
     pub started: Vec<StopStartResource>,
-    /// Who took the checkpoint, and the agent that did, if one did.
-    pub author: String,
+    /// Who took the checkpoint, and the agent that did, if one did; `None`
+    /// for a checkpoint taken on this machine, which records neither.
+    pub author: Option<String>,
     pub agent: Option<String>,
     /// Trackers that did not come across, and why; plus the restore's own.
     pub warnings: Vec<String>,
@@ -350,6 +417,11 @@ pub struct SpawnOutcome {
     /// source template on macOS. The workspace is the same either way; the
     /// spawn was only slower.
     pub template_warning: Option<String>,
+    /// Files that look like local secrets (`.env.local`, `master.key`),
+    /// gitignored in the project root and present there, that the new
+    /// workspace does not have: no tracker carries them, so the instance
+    /// lacks what the root's commands read (#83). Said, never copied.
+    pub left_behind: Vec<Utf8PathBuf>,
 }
 
 /// Checkpoint numbering is per name, and `remove` archives the binding record
@@ -602,6 +674,19 @@ fn long_running_action(
         .map(|(name, action)| (name.as_str(), action))
 }
 
+/// Who a one-shot command runs for, which decides where its input comes
+/// from and where its output goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneShot {
+    /// newgit runs it on someone's behalf (a spawn's `prepare`, a restore):
+    /// no input, output to its log only.
+    Hook,
+    /// Asked for by name with `newgit action`: the input newgit was given,
+    /// and output to the terminal and the log, or with `--quiet` the log
+    /// only. Quiet moves output; it does not take input away (#89).
+    Asked { quiet: bool },
+}
+
 /// The action that retries a resource whose own run failed, naming only
 /// actions it defines (#262): the one that builds its tree (`prepare`, or
 /// the recompute action), else its long-running action. `None` when it has
@@ -679,6 +764,85 @@ pub enum ActionOutcome {
 pub struct StopStartOutcome {
     pub instance: String,
     pub resources: Vec<StopStartResource>,
+    /// Ports `start` moved because another program holds the one the
+    /// binding named (#441).
+    pub moved_ports: Vec<MovedPort>,
+    /// What happened to the workspace: evicted by `stop --evict`, or
+    /// brought back by the `start` after it. `None` when it stayed put.
+    pub workspace: Option<WorkspaceChange>,
+    /// Said along the way, as `undo` says them, by the restore.
+    pub warnings: Vec<String>,
+}
+
+/// A claimed port `newgit start` found held by a program that is not newgit
+/// and replaced with a free one, so the rendered files and the exports agree
+/// with where the service will actually listen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedPort {
+    pub resource: String,
+    pub port: String,
+    pub from: u16,
+    pub to: u16,
+}
+
+impl MovedPort {
+    /// `` `db`'s `api` from 47600 to 47601 ``.
+    fn describe(&self) -> String {
+        format!(
+            "`{}`'s `{}` from {} to {}",
+            self.resource, self.port, self.from, self.to
+        )
+    }
+}
+
+/// What `newgit start` gathers while it brings resources back, besides
+/// each resource's own result.
+#[derive(Default)]
+struct StartReport {
+    moved_ports: Vec<MovedPort>,
+    warnings: Vec<String>,
+    /// Running dependents of a resource whose port moved, stopped to be
+    /// started again when the walk reaches them.
+    restarts: Vec<StoppedResource>,
+}
+
+/// What [`BranchManager::reclaim_busy_ports`] did to one resource.
+#[derive(Default)]
+struct Reclaim {
+    /// Saved to the binding record, whatever came after.
+    moved: Vec<MovedPort>,
+    warnings: Vec<String>,
+    /// Why the resource cannot start now: a held port that could not move,
+    /// or files that could not be rendered for the new one.
+    error: Option<String>,
+}
+
+/// What `newgit stop --evict`, or the `newgit start` after it, did to an
+/// instance's workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceChange {
+    /// Checkpointed to `checkpoint`, then deleted. `discarded` is what went
+    /// with it that no checkpoint carries and nothing declared disposable:
+    /// ignored paths no tracker owns and no resource rebuilds (only with
+    /// `--discard-ignored`).
+    Evicted {
+        checkpoint: String,
+        discarded: Vec<crate::evict::Discarded>,
+        /// Ignored paths a resource declares `disposable`, dropped with the
+        /// workspace for its build to refill (#447).
+        disposed: Vec<crate::evict::Disposed>,
+        /// What of the workspace's `.git/` no checkpoint and no save keeps
+        /// (reflogs, intent-to-add, hand-set index flags), said before the
+        /// delete.
+        not_kept: Vec<String>,
+    },
+    /// Materialized again and restored to `checkpoint`.
+    Restored { checkpoint: String },
+    /// Deleted by hand, and made again: from `checkpoint`, the instance's
+    /// latest, or from its source branch when it had none.
+    Rebuilt { checkpoint: Option<String> },
+    /// Already evicted, to `checkpoint`: nothing was deleted.
+    AlreadyEvicted { checkpoint: String },
 }
 
 impl StopStartOutcome {
@@ -790,12 +954,15 @@ pub struct InstanceReport {
 /// A running process whose port is not answering *yet* is not a problem: a
 /// dev server that compiles before it listens is doing what it should. It is
 /// `starting`, a state of its own that neither fails `is_ready` nor counts as
-/// a problem, and that clears by itself once the port answers.
+/// a problem, and that clears by itself once the port answers. Where a
+/// deadline was declared — a `[ready]`, or no process to watch — it is
+/// starting only within `timeout_seconds`, and a problem after (#276).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Readiness {
     /// What is wrong, one line each; empty when ready.
     pub problems: Vec<String>,
-    /// Running processes whose ports have not answered yet.
+    /// What is not up yet: a running process whose ports have not
+    /// answered, or a resource whose `[ready]` check does not pass.
     pub starting: Vec<Starting>,
 }
 
@@ -810,28 +977,112 @@ impl Readiness {
     }
 }
 
-/// A running resource process whose ports are not answering yet.
+/// A resource that is not up yet: a running process whose ports are not
+/// answering, or one whose `[ready]` check does not pass yet (#276).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Starting {
     pub resource: String,
-    /// The ports that have not answered, by name.
+    /// The ports that have not answered, by name. Empty when `[ready]`
+    /// names a check of its own.
     pub ports: BTreeMap<String, u16>,
+    /// How its `[ready]` check failed, when it names one (`GET
+    /// http://127.0.0.1:5173/ answered 500`).
+    pub check: Option<String>,
+    /// The log of its supervised process's run, when one is running: where
+    /// a server that crashed inside a wrapper that stayed up says why.
+    pub log: Option<Utf8PathBuf>,
 }
 
 impl Starting {
     /// One line, for `status` and the end of `spawn`.
     pub fn message(&self) -> String {
-        let ports = self
-            .ports
+        let log = self
+            .log
+            .as_ref()
+            .map(|log| format!("; its log is {log}"))
+            .unwrap_or_default();
+        match &self.check {
+            Some(check) => format!("`{}` is still starting: {check}{log}", self.resource),
+            None => format!(
+                "`{}` is still starting: not answering yet on {}{log}",
+                self.resource,
+                self.port_list()
+            ),
+        }
+    }
+
+    fn port_list(&self) -> String {
+        self.ports
             .iter()
             .map(|(name, port)| format!("{name} ({port})"))
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(", ")
+    }
+
+    /// The problem it is once its `[ready] timeout_seconds` has passed
+    /// (#276): what the check answered, what to do about it, and, for a
+    /// supervised process, its log and how that ends. `logs` is the
+    /// instance's log directory, for one with no process of its own.
+    fn overdue(
+        &self,
+        definition: &ResourceDefinition,
+        timeout: std::time::Duration,
+        logs: &Utf8Path,
+    ) -> String {
+        let name = &self.resource;
+        let what = self
+            .check
+            .clone()
+            .unwrap_or_else(|| format!("not answering on {}", self.port_list()));
+        let longer =
+            format!("give it a longer `[ready] timeout_seconds` in .newgit/resources/{name}.toml");
+        if let Some(log) = &self.log {
+            let tail = crate::supervisor::log_tail(log, OVERDUE_TAIL_LINES)
+                .into_iter()
+                .map(|line| format!("\n    | {line}"))
+                .collect::<String>();
+            return format!(
+                "`{name}` is not up after {}s ({what}); its process is running, so either it \
+                 failed inside a wrapper that stayed up (its log says), or it needs longer and \
+                 you can {longer}; its log is {log}{tail}",
+                timeout.as_secs()
+            );
+        }
+        let retry = match retry_command(definition) {
+            Some(retry) => format!("bring it back with `{retry}`, or {longer}"),
+            None => format!("bring it back, or {longer}"),
+        };
         format!(
-            "`{}` is still starting: not answering yet on {ports}",
-            self.resource
+            "`{name}` is not up after {}s ({what}); newgit runs no process of it to watch, so \
+             it may have gone down — {retry}; its logs are under {logs}",
+            timeout.as_secs()
         )
     }
+}
+
+/// How much of a supervised process's log a not-up problem shows.
+const OVERDUE_TAIL_LINES: usize = 8;
+
+/// Whether `path` is named the way local secrets and per-machine settings
+/// usually are: `.env`, `.env.local`, `.env.development.local`,
+/// `local.env`, `.envrc`, `.dev.vars`, `.npmrc`, `*.key`, `*.pem`, or
+/// anything with `secret` or `credential` in its name. A name test, not a content test: it decides
+/// only whether a spawn mentions a file it left behind, so the cost of a
+/// miss is the silence there was before (#83).
+fn looks_like_local_secret(path: &Utf8Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    name.starts_with(".env")
+        || name.ends_with(".env")
+        || name.starts_with(".dev.vars")
+        || name == ".npmrc"
+        || [".key", ".pem", ".p12", ".pfx", ".jks", ".keystore"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        || name.contains("secret")
+        || name.contains("credential")
 }
 
 /// Whether something accepts connections on `port` of this machine.
@@ -841,8 +1092,49 @@ fn port_answers(port: u16) -> bool {
 }
 
 /// How long `spawn` waits for the ports of what it started to answer before
-/// it reports them as still starting.
-pub const DEFAULT_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// it reports them as still starting, when no definition says otherwise.
+pub const DEFAULT_READY_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(crate::resource::DEFAULT_READY_TIMEOUT_SECONDS);
+
+/// The most one run of a `[ready] command` may take. A check that hangs
+/// is a failed check, and the wait it is part of goes on.
+const READY_CHECK_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a GET of `url` answers 200–399, redirects not followed. `Err`
+/// says what it answered instead.
+///
+/// Asked directly, never through `HTTP_PROXY` / `ALL_PROXY`: the check is of
+/// a server on this machine, and a proxy that cannot reach it would make a
+/// server that is up read as starting.
+///
+/// An `https://` certificate is checked against this machine's trust store,
+/// not a bundled list, so a local one trusted there (mkcert's) passes.
+fn http_answers(url: &str) -> std::result::Result<(), String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .proxy(None)
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(std::time::Duration::from_secs(2)))
+        .build()
+        .into();
+    match agent.get(url).call() {
+        Ok(response) if (200..400).contains(&response.status().as_u16()) => Ok(()),
+        Ok(response) => Err(format!("GET {url} answered {}", response.status().as_u16())),
+        // Said plainly: a TLS error reads like the server being down, and
+        // it is not. ureq does not expose the rustls error to match on.
+        Err(error) if error.to_string().contains("certificate") => Err(format!(
+            "GET {url}: this machine does not trust its certificate ({error}); a local \
+             certificate has to be trusted by the system, as `mkcert -install` does, or the \
+             check can ask `http://`"
+        )),
+        Err(error) => Err(format!("GET {url}: {error}")),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseReport {
@@ -855,7 +1147,8 @@ pub struct BaseReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceReport {
     pub name: String,
-    /// `running`, `stopped`, `ready`, `pending`, `failed`, or `—` (unbound).
+    /// `running`, `stopped`, `ready`, `not started`, `pending`, `failed`, or
+    /// `—` (unbound).
     pub state: String,
 }
 
@@ -866,6 +1159,9 @@ pub struct TrackerReport {
     pub content_rev: Option<String>,
     /// The lane head/default, when one has been merged.
     pub lane_head: Option<String>,
+    /// The bound rev and the lane head are two revs holding the same
+    /// content: one is the other encrypted to other recipients (#338).
+    pub same_content: bool,
 }
 
 impl TrackerReport {
@@ -878,7 +1174,10 @@ impl TrackerReport {
     /// direction is unknowable — this instance may be ahead, behind, or
     /// diverged — so callers must not advise one direction.
     pub fn diverged(&self) -> bool {
-        self.content_rev.is_some() && self.lane_head.is_some() && self.content_rev != self.lane_head
+        self.content_rev.is_some()
+            && self.lane_head.is_some()
+            && self.content_rev != self.lane_head
+            && !self.same_content
     }
 }
 
@@ -893,17 +1192,75 @@ pub struct RemoveOutcome {
     /// How many checkpoints removal left behind instead — retained disk the
     /// caller should be told about, since nothing reaches them any more.
     pub kept_checkpoints: usize,
+    /// The checkpoint that holds the workspace removal deleted, which the
+    /// archived record names as `removed_to`: the one removal took first
+    /// (reason `remove`), or for an evicted instance the one it was evicted
+    /// to. `newgit spawn --from-checkpoint <instance>/<id>` brings it back.
+    /// `None` when there was no workspace to take, with `--purge`, or when
+    /// the checkpoint failed under `--force`.
+    pub checkpoint: Option<String>,
+    /// Ignored paths a resource declares `disposable`, deleted with the
+    /// workspace for its build to refill (#447).
+    pub disposed: Vec<crate::evict::Disposed>,
+    /// What the removal deleted that no checkpoint holds (ignored files
+    /// nothing rebuilds, Git-only state such as the stash, and with
+    /// `--purge` or a failed checkpoint under `--force`, uncommitted work),
+    /// each said for a reader.
+    pub lost: Vec<String>,
+    /// Resource state the removal left in place: its capture failed, so no
+    /// checkpoint holds it, and its `[cleanup]` did not run.
+    pub left: Vec<LeftState>,
+    /// What the checkpoint said along the way.
+    pub warnings: Vec<String>,
     /// Why the instance could not be removed from the remote, when it was on
     /// one: its fork and token outlive it until removed there.
     pub remote_warning: Option<String>,
     /// What happened to the instance's source branch in the store, and why.
     pub source_branch: SourceBranchOutcome,
     /// The workspace's HEAD when no ref in the store contained it: commits
-    /// made after the last checkpoint, deleted with the workspace. `remove`
-    /// does not checkpoint first (the workspace is disposable), but it does
-    /// say so, rather than let "nothing unique" on the branch read as
-    /// "nothing lost".
+    /// made after the last checkpoint, deleted with the workspace. Only
+    /// when no checkpoint was taken first (`--purge`, or `--force` past a
+    /// failed one), since the checkpoint takes them into the store.
     pub unsaved_workspace_head: Option<String>,
+    /// Saved copies of what was at the workspace path when a restore was
+    /// cut short or failed ([`BranchInstance::saved_copies`]): kept, since
+    /// no checkpoint holds them.
+    pub saved_copies: Vec<Utf8PathBuf>,
+}
+
+/// One resource's state a removal left where it is, because the
+/// checkpoint taken first could not capture it ([`RemoveOutcome::left`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftState {
+    pub resource: String,
+    /// Why its capture failed.
+    pub reason: String,
+    /// Its `[cleanup] command` as it would have run, which names where the
+    /// state is and removes it by hand. `None` when it has none to run (no
+    /// hook, or ownership newgit never tears down): nothing would have
+    /// deleted it anyway.
+    pub cleanup: Option<String>,
+}
+
+/// What [`BranchManager::remove_forced`] left of each resource in
+/// `uncaptured`, from the hooks it did not run.
+fn left_state(hooks: &[HookOutcome], uncaptured: &BTreeMap<String, String>) -> Vec<LeftState> {
+    hooks
+        .iter()
+        .filter_map(|hook| {
+            let reason = uncaptured.get(&hook.resource)?;
+            let cleanup = match &hook.detail {
+                HookDetail::SkippedUncaptured(command) => Some(command.clone()),
+                HookDetail::SkippedUnresolved { command, .. } => Some(command.clone()),
+                _ => None,
+            };
+            Some(LeftState {
+                resource: hook.resource.clone(),
+                reason: reason.clone(),
+                cleanup,
+            })
+        })
+        .collect()
 }
 
 /// What `remove` should do with the instance's source branch.
@@ -1051,6 +1408,9 @@ pub struct BranchExported {
     pub same_commits: bool,
     /// Trackers in Git this target does not ship.
     pub withheld: Vec<String>,
+    /// The branch there was replaced, not added to: what newgit last put
+    /// there was built on commits the target has under other ids.
+    pub replaced: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1062,6 +1422,11 @@ pub struct RemoteExportOptions {
     /// A `git push` from the project root: only if the target's view moved
     /// since the last export, and never pulling from an ahead target.
     pub from_push: bool,
+    /// With `force`: replace the branch even when that puts back commits a
+    /// rewrite there removed since this machine last exported to it (a
+    /// force-push, perhaps to purge a secret). Without it, such a push is
+    /// refused, naming how many it would put back.
+    pub republish: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1082,6 +1447,30 @@ pub struct RemoteExportOutcome {
     /// say, as a pull request — brought into `main` before pushing (or, on a
     /// dry run, that would be). Zero when the target was not ahead.
     pub pulled: u32,
+    /// With `force`, commits this push puts back on the target that a
+    /// rewrite there (a force-push since this machine last exported to it)
+    /// had removed. Zero otherwise.
+    pub restored: usize,
+}
+
+/// What `newgit tracker pull --keep-mine` did: see
+/// [`BranchManager::pull_tracker_keep_mine`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptMine {
+    /// This instance's files as captured before the pull.
+    pub mine: String,
+    /// The `main` pulled.
+    pub main: Option<String>,
+    /// The rev mine and `main` share, against which mine's deletions are
+    /// judged. `None` when they share none: then nothing was deleted, and a
+    /// file mine deleted came back from `main`.
+    pub base: Option<String>,
+    /// Mine on top of it: what the instance is bound to now.
+    pub rev: String,
+    /// Files of `main` that mine replaced.
+    pub files: usize,
+    /// Files mine deleted since `base` that `main` still had: deleted again.
+    pub deleted: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1092,11 +1481,32 @@ pub struct CheckpointOutcome {
     /// Why the checkpoint is not on the remote, when there is one and syncing
     /// failed. (Also among `warnings`.)
     pub sync_error: Option<String>,
+    /// Whether the sync was refused here for a security reason (plaintext,
+    /// a stale set of recipients, content held encrypted that would leave
+    /// unencrypted, a tracker outside Git in what Git would push), rather
+    /// than failing to reach the remote: the command fails, though the
+    /// checkpoint stays.
+    pub sync_refused: bool,
     /// Trackers the remote refused, so left out of a sync that otherwise
     /// went through. (Each is also among `warnings`, with why.)
     pub left_out: Vec<String>,
     /// Resources that were not up, so not captured.
     pub degraded: Vec<String>,
+    /// Why each resource whose capture failed failed, said without
+    /// claiming the checkpoint was aborted (it went ahead without it).
+    pub capture_failures: BTreeMap<String, String>,
+}
+
+/// A resource capture's failure, as a checkpoint that went ahead without
+/// it says it: [`NewgitError::CheckpointCommandFailed`] says the checkpoint
+/// was aborted, which is true only where it refuses the checkpoint.
+fn capture_failure(error: &NewgitError) -> String {
+    match error {
+        NewgitError::CheckpointCommandFailed { code, log, .. } => {
+            format!("its checkpoint command exited with {code}; log: {log}")
+        }
+        other => other.to_string(),
+    }
 }
 
 /// A `git push` from a workspace, published: the checkpoint taken first, and
@@ -1209,6 +1619,12 @@ struct RestoreContext<'a> {
     /// ([`BranchManager::install_binding`]) is not the tree the checkpoint
     /// describes even when its identity paths are unchanged.
     dropped_before: Option<&'a BTreeSet<String>>,
+    /// A resource this one depends on whose recompute rebuilt or refilled
+    /// its tree earlier in this undo. A tree rebuilt from its inputs holds
+    /// none of what a dependent generated into it (`node_modules/.prisma`
+    /// under `node_modules`), so the dependent's own unchanged identity says
+    /// nothing about whether its output is still there.
+    rebuilt_dependency: Option<&'a str>,
     force_recompute: bool,
 }
 
@@ -1285,12 +1701,15 @@ pub struct UndoResourceOutcome {
     /// The status the resource is left in, as `newgit status` will report
     /// it. A restore that ran nothing leaves the status it found, so a
     /// `prepare` that failed before the undo is still `Failed` after it,
-    /// with `ok` true; a restart that failed after an ok restore is
-    /// `Failed` too.
+    /// with `ok` true. A restart that failed leaves it as the restore did:
+    /// that is the process's failure, not the binding's.
     pub status: ResourceStatus,
     /// The resource was running at checkpoint time and its restore was ok,
-    /// but starting it again failed. `ok` stays true — the restore did what
-    /// it set out to — and `status` is `Failed`.
+    /// but its process is not running again: starting it failed, or it was
+    /// held back behind a dependency whose restore failed (then
+    /// `blocked_by` names it). `ok` stays true — the restore did what it
+    /// set out to — and the process reads as never started until a start
+    /// succeeds.
     pub restart_failed: bool,
     /// Dependencies not `Ready` once the undo is done, as `newgit status`
     /// derives `blocked(..)` from them.
@@ -1336,12 +1755,34 @@ pub struct MergeTrackerOutcome {
     /// The remote project whose copy of the tracker's `main` moved too, for
     /// a tracker stored there.
     pub published: Option<String>,
+    /// Why the remote serves the tracker narrower than its definition says,
+    /// when it does: a fork held to its upstream's audience, whatever its
+    /// definition says now (#437). Readers its definition names may be
+    /// refused there.
+    pub capped: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddTrackerOutcome {
     pub path: Utf8PathBuf,
     pub ignored_patterns: Vec<String>,
+}
+
+/// What `newgit tracker create <name> --from <upstream>` made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkTrackerOutcome {
+    pub path: Utf8PathBuf,
+    pub upstream: String,
+    pub audience: String,
+    pub storage: Storage,
+    pub role: String,
+    /// The upstream had no role, and now fills this one too.
+    pub upstream_role_added: bool,
+    pub priority: i32,
+    /// The commit both `main`s are at.
+    pub main: String,
+    pub commits: usize,
+    pub paths: Vec<Utf8PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1385,7 +1826,34 @@ mod migrate;
 pub use migrate::MigrateOutcome;
 
 impl BranchManager {
+    /// Open the project. A fork whose definition needs fixing
+    /// ([`crate::tracker::fork_problems`]) refuses, saying what to type;
+    /// [`Self::open_to_repair`] opens anyway, for the commands that fix it.
     pub fn open(store: MetadataStore) -> Result<Self> {
+        let manager = Self::open_to_repair(store)?;
+        if manager.fork_problems.is_empty() {
+            return Ok(manager);
+        }
+        let list: Vec<String> = manager
+            .fork_problems
+            .iter()
+            .map(|(name, why)| format!("  `{}`: {why}", tracker_path(name)))
+            .collect();
+        Err(NewgitError::Unsupported(format!(
+            "{} needs fixing first:\n{}\n(`newgit tracker list` and `newgit tracker remove` \
+             still work meanwhile)",
+            if list.len() == 1 {
+                "a fork's definition"
+            } else {
+                "forks' definitions"
+            },
+            list.join("\n")
+        )))
+    }
+
+    /// [`Self::open`], with what is wrong with forks' definitions kept in
+    /// [`Self::fork_problems`] rather than refused.
+    pub fn open_to_repair(store: MetadataStore) -> Result<Self> {
         store.ensure_initialized()?;
         let config = store.load_config()?;
         let source = GitSource::open(&store.paths().project_root, config.project.source)?;
@@ -1403,6 +1871,7 @@ impl BranchManager {
             trackers.push(TrackerDefinition::access());
         }
         crate::tracker::resolve_ownership(&mut trackers)?;
+        let fork_problems = check_fork_records(&store, &trackers);
         let root = trackers.remove(
             trackers
                 .iter()
@@ -1449,7 +1918,43 @@ impl BranchManager {
             root,
             carved,
             locks: Mutex::new(BTreeMap::new()),
+            keys: Arc::new(crate::crypt::PublishedKeys::from_env()),
+            audiences: Mutex::new(BTreeMap::new()),
+            reseal_failures: Mutex::new(BTreeMap::new()),
+            unsent: Mutex::new(BTreeMap::new()),
+            fork_problems,
+            restoring: Mutex::new(BTreeSet::new()),
         })
+    }
+
+    /// Read members' public keys from `keys` instead of GitHub.
+    pub fn with_key_source(mut self, keys: Arc<dyn crate::crypt::KeySource>) -> Self {
+        self.keys = keys;
+        self
+    }
+
+    /// What this machine recorded each fork started at, for split: a commit
+    /// that drops or changes `from` is still held to it.
+    fn fork_records(&self) -> Vec<crate::tracker::EarlierFork> {
+        crate::tracker_repo::fork_records(&self.store.paths().tracker_store)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(fork, upstream)| crate::tracker::EarlierFork {
+                audience: self
+                    .all_definitions()
+                    .into_iter()
+                    .find(|definition| definition.name == upstream)
+                    .map(|definition| definition.audience),
+                fork,
+                upstream,
+            })
+            .collect()
+    }
+
+    /// Forks whose definitions need fixing, as `(tracker, why)`, when this
+    /// manager was opened with [`Self::open_to_repair`].
+    pub fn fork_problems(&self) -> &[(String, String)] {
+        &self.fork_problems
     }
 
     /// Hold `slug`'s lock for the rest of the command: every command that
@@ -1981,10 +2486,19 @@ impl BranchManager {
                 &all,
                 Some(&mount),
             )? {
+                // All of an import is new to this project, and would be sent
+                // to its remote and its targets, so all of it is judged.
+                let inside = path
+                    .strip_prefix(&format!("{mount}/"))
+                    .unwrap_or(path.as_str());
                 return Err(NewgitError::SplitRefused(format!(
                     "commit {} of {from} adds `{path}`, which belongs to `{tracker}`, a tracker \
                      outside Git: its files (secrets among them) never come in or leave through \
-                     Git, so nothing was imported",
+                     Git, so nothing was imported. Every commit of an import is new here, so \
+                     every one is checked. To import it, take `{inside}` out of that history \
+                     (in a clone, `git filter-repo --invert-paths --path {inside}`) and import \
+                     from the clone; if `{path}` is not a secret, take it out of `{tracker}`'s \
+                     paths instead",
                     short(&commit)
                 )));
             }
@@ -2088,7 +2602,7 @@ impl BranchManager {
         let committer = ident("GIT_COMMITTER_IDENT")?;
         let blob = {
             use std::io::Write as _;
-            let mut child = std::process::Command::new("git")
+            let mut child = crate::git::command()
                 .arg("-C")
                 .arg(root.as_str())
                 .args(["hash-object", "-w", "--stdin"])
@@ -2135,19 +2649,19 @@ impl BranchManager {
                 moved.push((access.to_owned(), made.clone()));
                 objects.set_path(
                     &commit.tree,
-                    &format!("{}/{access}", crate::compose::PINS_DIR),
+                    format!("{}/{access}", crate::compose::PINS_DIR),
                     Some((crate::objects::GITLINK_MODE.to_vec(), made)),
                 )?
             }
             None => objects.set_path(
                 &commit.tree,
-                &format!("{}/{name}.toml", crate::tracker::DEFINITIONS_DIR),
+                format!("{}/{name}.toml", crate::tracker::DEFINITIONS_DIR),
                 Some(file),
             )?,
         };
         let tree = objects.set_path(
             &tree,
-            &format!("{}/{}", crate::compose::PINS_DIR, pin.0),
+            format!("{}/{}", crate::compose::PINS_DIR, pin.0),
             Some((crate::objects::GITLINK_MODE.to_vec(), pin.1.clone())),
         )?;
         moved.push(pin.clone());
@@ -2398,7 +2912,7 @@ impl BranchManager {
 
     /// Every definition, trackers outside Git included: what names the owner of
     /// a path nothing bound owns.
-    fn all_definitions(&self) -> Vec<TrackerDefinition> {
+    pub fn all_definitions(&self) -> Vec<TrackerDefinition> {
         self.carved_definitions()
             .into_iter()
             .chain(self.trackers.iter().cloned())
@@ -2474,7 +2988,7 @@ impl BranchManager {
             &[format!("+refs/heads/*:refs/history/{tracker}/*")],
             Some(&basic_auth_header(&credential)),
         )?;
-        crate::source::run_git_env(
+        crate::source::run_fetch(
             &[
                 "-C",
                 project.as_str(),
@@ -2628,8 +3142,34 @@ impl BranchManager {
                 audience: &audience,
                 newgit_made,
                 need_history: &|tracker| self.need_history(tracker),
+                forks_before: &self.fork_records(),
+                settled: &self.settled_roots(),
             },
         )?)
+    }
+
+    /// Root's `main` wherever this machine has it: its own, and the remote's
+    /// as last fetched and as last composed. What a split takes as the
+    /// project's history, never to be made again.
+    fn settled_roots(&self) -> Vec<String> {
+        let root = &self.root.name;
+        let listed = crate::source::run_git_env(
+            &[
+                "-C",
+                self.store.paths().project_root.as_str(),
+                "for-each-ref",
+                "--format=%(objectname)",
+                &local_tracker_ref(root, "main"),
+                &format!("refs/newgit/remote/{root}/main"),
+                ROOT_MAIN_ON_REMOTE,
+            ],
+            &[],
+        )
+        .unwrap_or_default();
+        let mut roots: Vec<String> = listed.lines().map(ToOwned::to_owned).collect();
+        roots.sort();
+        roots.dedup();
+        roots
     }
 
     /// Split instance `slug`'s commits up to `tip` into its tracker
@@ -2648,14 +3188,7 @@ impl BranchManager {
         } else {
             let branch = self.store.find_branch(slug).ok();
             if let Some(branch) = &branch {
-                // Failing leaves the split to make commits of its own, which
-                // work, but a mirror will see as new.
-                if let Err(error) = self.learn_view_from(&branch.workspace_path, tip) {
-                    eprintln!(
-                        "newgit: could not read what the remote made of `main`, so commits \
-                         exported from `{slug}` may not match a mirror's: {error}"
-                    );
-                }
+                self.learn_before_split(branch, tip);
             }
             branch.map(|branch| branch.dropped).unwrap_or_default()
         };
@@ -2671,6 +3204,21 @@ impl BranchManager {
         Ok(outcome.made.len())
     }
 
+    /// [`Self::learn_view_from`] before `branch`'s commits up to `tip` are
+    /// split. Failing leaves the split to make root commits of its own for
+    /// what the remote has split already, so a mirror sees those commits as
+    /// new, until a later split learns of the remote's and splits this
+    /// instance's again, onto them.
+    fn learn_before_split(&self, branch: &BranchInstance, tip: &str) {
+        if let Err(error) = self.learn_view_from(&branch.workspace_path, tip) {
+            eprintln!(
+                "newgit: could not read what the remote made of `main`, so commits exported \
+                 from `{}` may not match a mirror's until it can: {error}",
+                branch.slug
+            );
+        }
+    }
+
     /// Refuse when any commit `rev_list` selects (in `repo`) adds or changes
     /// a file a tracker outside Git owns — every commit, every parent of a merge.
     /// The one gate for what trackers outside Git own: a push runs it over everything it sends,
@@ -2682,6 +3230,7 @@ impl BranchManager {
         env: &[(String, String)],
     ) -> Result<()> {
         let all = self.all_definitions();
+        self.refuse_held_sealed(repo, rev_list, env, None)?;
         match crate::compose::find_outside_git(repo, rev_list, env, &all)? {
             None => Ok(()),
             Some((commit, path, tracker)) => Err(NewgitError::SplitRefused(format!(
@@ -2692,6 +3241,40 @@ impl BranchManager {
                 &commit[..commit.len().min(12)]
             ))),
         }
+    }
+
+    /// Refuse when a commit about to be pushed through Git adds or changes
+    /// a path this machine has held encrypted content at, whatever tracker
+    /// claims it now (a definition turned `git = true`, or a tracker in Git
+    /// claiming the path, #338): the same confirmation a capture in
+    /// plaintext waits for, `newgit tracker allow-plaintext <path>`.
+    fn refuse_held_sealed(
+        &self,
+        repo: &Utf8Path,
+        rev_list: &[&str],
+        env: &[(String, String)],
+        mount: Option<&Utf8Path>,
+    ) -> Result<()> {
+        let held = self.held_sealed_paths()?;
+        let Some((commit, path)) =
+            crate::compose::find_held_sealed(repo, rev_list, env, &held, mount)?
+        else {
+            return Ok(());
+        };
+        let owner = crate::tracker::owner_of(&self.all_definitions(), Utf8Path::new(&path))
+            .map_or_else(|| "root".to_owned(), |owner| owner.name.clone());
+        let quoted = encryption::shell_quote(&path);
+        Err(NewgitError::PlaintextRefused(format!(
+            "commit {} changes `{path}`, which held content encrypted to its audience on this \
+             machine (captured encrypted here, or decrypted into a workspace here). It belongs \
+             to `{owner}` now, a tracker in Git, so it would be pushed as it is. Definitions \
+             arrive through `access`, `newgit merge main`, and `pull`, so it is not pushed until \
+             you release the path on this machine: `newgit tracker allow-plaintext {quoted}`. \
+             Or take it out of that commit (`git rm --cached {quoted}` then `git commit \
+             --amend`, or an interactive rebase if the commit is older) and try again. Who \
+             changed the definitions: `git log -p -- .newgit/trackers/`",
+            &commit[..commit.len().min(12)]
+        )))
     }
 
     /// Put branch `branch` here, composed from root's `main` in the tracker
@@ -2751,6 +3334,7 @@ impl BranchManager {
     /// `AGENTS.md` is `apps/t3code/AGENTS.md`, not the `AGENTS.md` a tracker
     /// outside Git owns at the top. Everything else is judged as it is.
     fn refuse_unpublished_trackers(&self, commits: &[(&str, &str)]) -> Result<()> {
+        self.refuse_dropped(commits, "sending them to the remote")?;
         let all = self.all_definitions();
         let root = self.store.paths().project_root.clone();
         let mut plain = Vec::new();
@@ -2764,6 +3348,7 @@ impl BranchManager {
                 plain.push(*commit);
                 continue;
             };
+            self.refuse_held_sealed(&root, &[commit], &[], Some(&mount))?;
             if let Some((found, path, owner)) =
                 crate::compose::find_outside_git_under(&root, &[commit], &[], &all, Some(&mount))?
             {
@@ -2842,7 +3427,12 @@ impl BranchManager {
             return Ok(());
         };
         let main = format!("refs/remotes/{PUBLISH_REMOTE}/{PROJECT_ROOT_INSTANCE}");
-        let Ok(fetched) = crate::source::run_git_env(
+        // The remote's `main` as the workspace fetched it, and as the project
+        // root did: an instance spawned on a `main` the project root fetched
+        // and never pulled (a Claude Code worktree's fresh base) starts there,
+        // in a workspace whose own `origin/main` is the project root's branch.
+        let mut fetched: Vec<String> = Vec::new();
+        if let Ok(commit) = crate::source::run_git_env(
             &[
                 "-C",
                 workspace.as_str(),
@@ -2852,20 +3442,25 @@ impl BranchManager {
                 &main,
             ],
             &[],
-        ) else {
-            return Ok(());
-        };
-        // Not merged yet, so not in anything being split.
-        if self
-            .source
-            .rev_parse(&format!("{fetched}^{{commit}}"))
-            .is_err()
-        {
-            return Ok(());
+        ) {
+            fetched.push(commit.trim().to_owned());
         }
+        fetched.extend(self.source.rev_parse(&main).ok());
+        fetched.dedup();
         let project = self.store.paths().project_root.clone();
-        // As the workspace: a push from it may have no login behind it.
-        self.learn_view(link, Acting::Workspace(workspace), &project, tip, &fetched)
+        for fetched in &fetched {
+            // Not merged yet, so not in anything being split.
+            if self
+                .source
+                .rev_parse(&format!("{fetched}^{{commit}}"))
+                .is_err()
+            {
+                continue;
+            }
+            // As the workspace: a push from it may have no login behind it.
+            self.learn_view(link, Acting::Workspace(workspace), &project, tip, fetched)?;
+        }
+        Ok(())
     }
 
     /// Note the view commits `tip` shares with `fetched`, the remote's `main`,
@@ -2896,6 +3491,11 @@ impl BranchManager {
         // never made) recomposed all of `main` on every push, twice: once in
         // the checkpoint's sync, once in the push. The project's own record
         // says where `main` is; its trackers are fetched only to compose it.
+        //
+        // With every pin this machine has now, too: composing leaves out a
+        // pin that is not here, so a `main` composed before one of its
+        // trackers arrived noted views the remote never served, and the
+        // commits the remote did serve were split again.
         let view = "refs/newgit/views/branches/main";
         let composed = |root: &str| {
             self.source.rev_parse(ROOT_MAIN_ON_REMOTE).ok().as_deref() == Some(root)
@@ -2904,6 +3504,7 @@ impl BranchManager {
                         .ok()
                         .flatten()
                         .is_some_and(|(_, noted)| noted == root)
+                        && self.composed_with_every_pin(project, &commit, root)
                 })
         };
         let recorded = client.project(link.project.as_str())?;
@@ -2922,10 +3523,46 @@ impl BranchManager {
         if let Some(root) = list.get(&self.root.name)
             && !composed(root)
         {
+            // A tracker whose commit did not come would be left out of the
+            // view composed, which is then not the one the remote serves:
+            // said, and tried again at the next split rather than composed
+            // and taken as done.
+            let lacking: Vec<String> = list
+                .iter()
+                .filter(|(_, commit)| {
+                    self.source
+                        .rev_parse(&format!("{commit}^{{commit}}"))
+                        .is_err()
+                })
+                .map(|(tracker, commit)| {
+                    format!(
+                        "`{}` at {}",
+                        crate::tracker::tracker_path(tracker),
+                        &commit[..commit.len().min(12)]
+                    )
+                })
+                .collect();
+            if !lacking.is_empty() {
+                return Err(NewgitError::Unsupported(format!(
+                    "the remote's `main` pins {}, which its repo did not send",
+                    lacking.join(", ")
+                )));
+            }
             self.compose_here(view, root)?;
             self.source.update_ref(ROOT_MAIN_ON_REMOTE, root)?;
         }
         Ok(())
+    }
+
+    /// Whether `view`, composed from root commit `root`, holds what `root`
+    /// composes to with every pin this machine has now.
+    fn composed_with_every_pin(&self, project: &Utf8Path, view: &str, root: &str) -> bool {
+        let trees = || -> Result<(String, String)> {
+            let mut objects = crate::objects::Objects::open(project)?;
+            let composed = objects.commit(view)?.tree;
+            Ok((composed, crate::compose::view_tree(&mut objects, root)?))
+        };
+        trees().is_ok_and(|(composed, now)| composed == now)
     }
 
     /// On a linked project, make the project root's `origin` the remote's
@@ -3127,8 +3764,8 @@ impl BranchManager {
         let mut problems = Vec::new();
         if !branch.workspace_path.is_dir() {
             problems.push(format!(
-                "its workspace is missing ({})",
-                branch.workspace_path
+                "its workspace is missing ({}); `newgit start {}` rebuilds it",
+                branch.workspace_path, branch.name
             ));
             return Readiness {
                 problems,
@@ -3137,6 +3774,35 @@ impl BranchManager {
         }
         let mut starting = Vec::new();
         let supervisor = self.supervisor(branch);
+        let suspended = self.suspended(branch);
+        // Every check up front, each on a thread of its own: a `[ready]
+        // command` may take seconds waiting on something else, and an
+        // instance's resources do not wait on each other to be asked (#276).
+        // Used below only where the resource gets that far.
+        let mut checked: BTreeMap<String, Option<Starting>> = std::thread::scope(|scope| {
+            let asked: Vec<_> = branch
+                .resources
+                .iter()
+                .filter_map(|(name, binding)| {
+                    let definition = self.resource_definition(name).ok()?;
+                    self.ready_to_check(branch, definition, &supervisor, &suspended)
+                        .then(|| {
+                            let check =
+                                scope.spawn(|| self.not_up_yet(branch, definition, binding));
+                            (name.clone(), check)
+                        })
+                })
+                .collect();
+            asked
+                .into_iter()
+                .map(|(name, check)| {
+                    let not_yet = check
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    (name, not_yet)
+                })
+                .collect()
+        });
         for (name, binding) in &branch.resources {
             let Ok(definition) = self.resource_definition(name) else {
                 continue;
@@ -3164,15 +3830,24 @@ impl BranchManager {
                     ));
                     continue;
                 }
+                ResourceStatus::Failed if binding.restore_error.is_some() => {
+                    problems.push(format!(
+                        "`{name}` failed to restore: {} — repair it, then `newgit undo` again; \
+                         its logs are under {logs}",
+                        binding.restore_error.as_deref().unwrap_or_default()
+                    ));
+                    continue;
+                }
                 ResourceStatus::Failed => {
+                    let log = last_log_line(
+                        last_action_log(&logs, name, definition.producing_action()),
+                        &logs,
+                    );
                     problems.push(match retry_command(definition) {
-                        Some(retry) => format!(
-                            "`{name}` failed — retry with `{retry}`; its logs are under {logs}"
-                        ),
-                        None => format!(
-                            "`{name}` failed, and defines no action that retries it; its logs \
-                             are under {logs}"
-                        ),
+                        Some(retry) => format!("`{name}` failed — retry with `{retry}`; {log}"),
+                        None => {
+                            format!("`{name}` failed, and defines no action that retries it; {log}")
+                        }
                     });
                     continue;
                 }
@@ -3198,6 +3873,10 @@ impl BranchManager {
                     continue;
                 }
             }
+            // Bound before its definition changed: a port, an export, a
+            // render, a `prepare` or the running command it no longer
+            // matches, with what applies it (#85).
+            problems.extend(self.definition_drift(branch, definition, binding, &supervisor));
             for path in definition.identity_produces() {
                 if !branch.workspace_path.join(path).exists() {
                     problems.push(format!(
@@ -3216,28 +3895,235 @@ impl BranchManager {
             {
                 problems.push(format!(
                     "`{name}.{action_name}` {} without being stopped — restart it with \
-                     `newgit action {name}.{action_name}` or `newgit start`; its logs are under \
-                     {logs}",
-                    death.describe()
+                     `newgit action {name}.{action_name}` or `newgit start`; {}",
+                    death.describe(),
+                    last_log_line(supervisor.last_log(name), &logs)
                 ));
                 continue;
             }
-            if supervisor.running_pid(name).is_some() {
-                let ports: BTreeMap<String, u16> = binding
-                    .resolved_ports
-                    .iter()
-                    .filter(|(_, port)| !port_answers(**port))
-                    .map(|(port_name, port)| (port_name.clone(), *port))
-                    .collect();
-                if !ports.is_empty() {
-                    starting.push(Starting {
-                        resource: name.clone(),
-                        ports,
-                    });
+            // Never started, though its resource is ready: a spawn or a
+            // `start` held it back behind a dependency that was not up
+            // (#54). It is as down as one that died.
+            if let Some((action_name, _)) = definition.autostart_action()
+                && supervisor.state(name) == ProcessState::NeverStarted
+            {
+                problems.push(format!(
+                    "`{name}.{action_name}` was not started — start it with `newgit start` or \
+                     `newgit action {name}.{action_name}`"
+                ));
+                continue;
+            }
+            if let Some(Some(not_yet)) = checked.remove(name) {
+                // Starting only within its `[ready] timeout_seconds` of being
+                // started, or, with no process to watch, of being brought up
+                // (#276). Past that, still starting and down look the same
+                // from here, and the definition said how long up takes.
+                //
+                // A deadline only where one was declared: a `[ready]` said
+                // what up means and how long it takes, or there is no process
+                // whose being alive says anything. A supervised process with
+                // no `[ready]` is starting for as long as it runs.
+                let mut not_yet = not_yet;
+                let running = supervisor.running_pid(name).is_some();
+                if running {
+                    not_yet.log = supervisor.log_path(name);
+                }
+                let since = if running {
+                    supervisor.started_at(name)
+                } else {
+                    supervisor.came_up_at(name)
+                };
+                let timeout = definition.ready_timeout();
+                let deadline = definition.ready.is_some() || !running;
+                if !deadline
+                    || since
+                        .and_then(|since| since.elapsed().ok())
+                        .is_some_and(|age| age < timeout)
+                {
+                    starting.push(not_yet);
+                } else {
+                    problems.push(not_yet.overdue(definition, timeout, &logs));
                 }
             }
         }
+        // A claimed port somebody else holds: what answers there is not this
+        // instance, so it is not up and not starting either.
+        let held = self.ports_held_elsewhere(branch, &supervisor, &suspended);
+        starting.retain(|not_yet| !held.contains_key(&not_yet.resource));
+        problems.extend(held.into_values().flatten());
+        problems.extend(self.undefined_binding_problems(branch, &supervisor));
+        problems.extend(self.unbound_definition_problems(branch));
+        problems.extend(self.bound_definition_problems(branch));
         Readiness { problems, starting }
+    }
+
+    /// The resources `newgit stop` suspended and `start` has not resumed:
+    /// down on purpose, so not checked for being up.
+    fn suspended(&self, branch: &BranchInstance) -> BTreeSet<String> {
+        self.load_stopped_record(branch)
+            .map(|record| {
+                record
+                    .resources
+                    .iter()
+                    .filter(|entry| entry.is_resume())
+                    .map(|entry| entry.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether `definition` is something to check for being up right now:
+    /// its supervised process is running, or it has none to run and its
+    /// `[ready]` names a check of its own (a stack its `prepare` started),
+    /// and it is not suspended. A resource that is ready once its `prepare`
+    /// exits, with nothing declared, has nothing to check.
+    fn ready_to_check(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        supervisor: &Supervisor,
+        suspended: &BTreeSet<String>,
+    ) -> bool {
+        if supervisor.running_pid(&definition.name).is_some() {
+            return true;
+        }
+        definition.has_ready_check()
+            && !definition.has_long_running_action()
+            && !suspended.contains(&definition.name)
+            && branch
+                .resources
+                .get(&definition.name)
+                .is_some_and(|binding| binding.status == ResourceStatus::Ready)
+    }
+
+    /// `None` when `definition` is up now; otherwise what it is waiting on.
+    /// Up means its `[ready]` check passes, or, with none, every port it
+    /// claims answers (#276).
+    fn not_up_yet(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        binding: &crate::branch::ResourceBinding,
+    ) -> Option<Starting> {
+        let name = &definition.name;
+        let ready = definition.ready.as_ref();
+        if let Some(url) = ready.and_then(|ready| ready.http.as_deref()) {
+            let url = self.render_as_action_command(branch, definition, url);
+            return http_answers(&url).err().map(|check| Starting {
+                resource: name.clone(),
+                ports: BTreeMap::new(),
+                check: Some(check),
+                log: None,
+            });
+        }
+        if let Some(command) = ready.and_then(|ready| ready.command.as_deref()) {
+            return self
+                .ready_command_passes(branch, definition, command)
+                .err()
+                .map(|check| Starting {
+                    resource: name.clone(),
+                    ports: BTreeMap::new(),
+                    check: Some(check),
+                    log: None,
+                });
+        }
+        let ports: BTreeMap<String, u16> = binding
+            .resolved_ports
+            .iter()
+            .filter(|(_, port)| !port_answers(**port))
+            .map(|(port_name, port)| (port_name.clone(), *port))
+            .collect();
+        (!ports.is_empty()).then(|| Starting {
+            resource: name.clone(),
+            ports,
+            check: None,
+            log: None,
+        })
+    }
+
+    /// Run `[ready] command` once, as an action would run, with up to
+    /// [`READY_CHECK_LIMIT`] to finish. `Err` says how it failed.
+    fn ready_command_passes(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        command: &str,
+    ) -> std::result::Result<(), String> {
+        let action = crate::resource::ActionSpec {
+            command: Some(command.to_owned()),
+            workdir: None,
+            long_running: false,
+            autostart: false,
+            signal: None,
+            captures: Vec::new(),
+        };
+        let (rendered, cwd) = self
+            .action_invocation(branch, definition, &action, "ready")
+            .map_err(|error| error.to_string())?;
+        let env = self
+            .assemble_env(branch)
+            .map_err(|error| error.to_string())?;
+        let mut check = std::process::Command::new("sh");
+        check
+            .arg("-c")
+            .arg(&rendered)
+            .current_dir(&cwd)
+            .envs(env.iter().map(|(key, value)| (key, value)))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            // Its own group, so a check that hangs is killed with whatever
+            // it started.
+            check.process_group(0);
+        }
+        let mut child = check
+            .spawn()
+            .map_err(|error| format!("`{rendered}` could not run: {error}"))?;
+        let deadline = std::time::Instant::now() + READY_CHECK_LIMIT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(status)) => {
+                    return Err(match status.code() {
+                        Some(code) => format!("`{rendered}` exited {code}"),
+                        None => format!("`{rendered}` was killed"),
+                    });
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    #[cfg(unix)]
+                    let _ = nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(child.id() as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "`{rendered}` did not finish within {}s",
+                        READY_CHECK_LIMIT.as_secs()
+                    ));
+                }
+                Err(error) => return Err(format!("`{rendered}`: {error}")),
+            }
+        }
+    }
+
+    /// How long the end of `spawn` waits for what it started to come up:
+    /// the longest `[ready] timeout_seconds` among the bound resources,
+    /// five seconds when none says.
+    pub fn ready_wait(&self, branch: &BranchInstance) -> std::time::Duration {
+        branch
+            .resources
+            .keys()
+            .filter_map(|name| self.resource_definition(name).ok())
+            .map(ResourceDefinition::ready_timeout)
+            .max()
+            .unwrap_or(DEFAULT_READY_WAIT)
     }
 
     /// [`Self::readiness`], after giving what is still starting up to `wait`
@@ -3266,9 +4152,23 @@ impl BranchManager {
     /// must be gitignored unless deliberately dual-tracked with source.
     pub fn gitignore_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
+        let paths: Vec<&str> = self
+            .trackers
+            .iter()
+            .flat_map(|definition| definition.paths.iter().map(|path| path.as_str()))
+            .collect();
+        // Asked of Git once for every path, not once per path: this runs
+        // ahead of most commands. A question Git could not answer warns of
+        // nothing, as before.
+        let tracked = self.source.tracked_among(&paths).ok();
+        let ignored = self.source.ignored_among(&paths).ok();
         for definition in &self.trackers {
             for path in &definition.paths {
-                if let Ok(true) = self.source.is_tracked(path.as_str()) {
+                let path = path.as_str();
+                if tracked
+                    .as_ref()
+                    .is_some_and(|tracked| tracked.contains(path))
+                {
                     warnings.push(format!(
                         "tracker `{}` owns `{path}`, which Git also tracks (dual-tracked): \
                          branch-local content will show as modifications and can be committed \
@@ -3276,7 +4176,10 @@ impl BranchManager {
                          this is deliberate",
                         definition.name
                     ));
-                } else if let Ok(false) = self.source.is_ignored(path.as_str()) {
+                } else if ignored
+                    .as_ref()
+                    .is_some_and(|ignored| !ignored.contains(path))
+                {
                     warnings.push(format!(
                         "tracker `{}` owns `{path}` but the store repo does not gitignore it; \
                          agents may commit it into source history (fine only if deliberately \
@@ -3389,6 +4292,7 @@ impl BranchManager {
             &self.source,
             &branch,
             &self.sparse_patterns(&branch.dropped),
+            &self.export_mains_to_carry(&branch.dropped),
         )?;
         if !branch.dropped.is_empty() {
             self.apply_sparse_to(&branch, true)?;
@@ -3435,6 +4339,7 @@ impl BranchManager {
         } else {
             Vec::new()
         };
+        let left_behind = self.left_behind(&branch.workspace_path);
 
         // The instance exists locally whatever the remote says: a failure to
         // register is reported, not fatal, and retried at the next checkpoint.
@@ -3455,7 +4360,37 @@ impl BranchManager {
             projection_warning,
             template_warning,
             behind: self.behind(&branch_source_rev).unwrap_or_default(),
+            left_behind,
         })
+    }
+
+    /// The files [`SpawnOutcome::left_behind`] names: ignored in the
+    /// project root, there, named like a secret, and missing from
+    /// `workspace` once its trackers are bound. Missing is the test of "no
+    /// tracker carries it", so a render or a resource that writes the file
+    /// counts as carrying it too. A file a tracker other than `root` already
+    /// owns is not named either: that tracker has no content for it yet, or
+    /// this instance does not bind it, and the advice to make a tracker for
+    /// it would be wrong. Only files: a wholly ignored directory is not
+    /// looked into, so a `secrets/` ignored whole is not named. Best
+    /// effort: a root Git cannot list names nothing.
+    fn left_behind(&self, workspace: &Utf8Path) -> Vec<Utf8PathBuf> {
+        let root = &self.store.paths().project_root;
+        let Ok(entries) = crate::evict::ignored_entries(root) else {
+            return Vec::new();
+        };
+        let definitions = self.all_definitions();
+        entries
+            .into_iter()
+            .filter(|(path, dir)| {
+                !dir && !path.starts_with(".newgit")
+                    && looks_like_local_secret(path)
+                    && !workspace.join(path).exists()
+                    && crate::tracker::owner_of(&definitions, path)
+                        .is_none_or(|owner| owner.name == self.root.name)
+            })
+            .map(|(path, _)| path)
+            .collect()
     }
 
     /// Put an instance on the project's remote, if it has one and the instance
@@ -3509,32 +4444,144 @@ impl BranchManager {
         )
     }
 
-    /// Spawn someone's checkpoint here: a new instance named `name` that comes
-    /// up as the checkpoint was — source (uncommitted work included), tracker
+    /// Spawn a checkpoint here: a new instance named `name` that comes up as
+    /// the checkpoint was — source (uncommitted work included), tracker
     /// content, and resource state such as a database restored from its dump.
     ///
-    /// Trackers resolve for the person spawning, not the author: a per-user
+    /// A checkpoint this machine has (`newgit checkpoints` lists it, even of
+    /// an instance since removed) is spawned from here, as it is, with no
+    /// remote involved. Any other comes from the project's remote, where
+    /// trackers resolve for the person spawning, not the author: a per-user
     /// tracker gets *their own* content, a shared one the checkpoint's exact
     /// rev, and one they may not read nothing — each said in `warnings`.
     ///
-    /// Built from parts that already exist: fetch, `spawn` at the checkpoint's
-    /// head, import the record into the new instance's own history, `undo`
-    /// to it.
+    /// Built from parts that already exist: (fetch,) `spawn` at the
+    /// checkpoint's head, copy the record into the new instance's own
+    /// history, `undo` to it.
     pub fn spawn_from_checkpoint(
         &self,
         name: &str,
         from_instance: &str,
         checkpoint_id: &str,
     ) -> Result<SpawnFromCheckpointOutcome> {
-        let link = self.remote.as_ref().ok_or(NewgitError::NoRemote)?;
         validate_name(name)?;
+        let from_slug = branch_slug(from_instance);
+        // Whether a failure below left an instance behind, or failed before
+        // making one (or refused because one by the name exists).
+        let existed = self.store.branch_record_path(&branch_slug(name)).exists();
+        let local = CheckpointLog::new(self.store.checkpoint_dir(&from_slug), from_instance);
+        let spawned = if local
+            .list()?
+            .iter()
+            .any(|record| record.id == checkpoint_id)
+        {
+            self.spawn_from_local_checkpoint(name, &from_slug, local.load(checkpoint_id)?)
+        } else if self.remote.is_none() {
+            return Err(NewgitError::UnknownCheckpoint {
+                instance: from_instance.to_owned(),
+                id: checkpoint_id.to_owned(),
+            });
+        } else {
+            self.spawn_from_remote_checkpoint(name, &from_slug, checkpoint_id)
+        };
+        spawned.map_err(|error| {
+            if existed {
+                return error;
+            }
+            self.half_built(name, &format!("{from_slug}/{checkpoint_id}"), error)
+        })
+    }
+
+    /// A spawn from a checkpoint that failed after the instance was made:
+    /// kept as far as it got, for inspection, as a plain spawn that fails
+    /// midway is, and `error` extended with the commands that finish it
+    /// (the undo to the checkpoint's copy in its own history) or remove
+    /// it, so the spawn can be run again. `error` as it is when no instance
+    /// was made.
+    fn half_built(&self, name: &str, from: &str, error: NewgitError) -> NewgitError {
+        let Ok(branch) = self.store.find_branch(name) else {
+            return error;
+        };
+        let copy = self
+            .checkpoint_log(&branch)
+            .list()
+            .ok()
+            .and_then(|records| {
+                records
+                    .into_iter()
+                    .find(|record| record.instance.as_deref() == Some(branch.id.as_str()))
+                    .map(|record| record.id)
+            });
+        let finish = match copy {
+            Some(id) => format!(
+                "Fix what failed, then `newgit undo {} --to {id}` restores it to {from}; or ",
+                branch.name
+            ),
+            None => String::new(),
+        };
+        NewgitError::Unsupported(format!(
+            "{error}\n`{}` was spawned but not restored to {from}, and is kept as it is for \
+             inspection (its workspace is {}). {finish}`newgit remove {} --purge` removes it, \
+             so `newgit spawn {} --from-checkpoint {from}` can run again",
+            branch.name, branch.workspace_path, branch.name, branch.name
+        ))
+    }
+
+    /// [`Self::spawn_from_checkpoint`] of a checkpoint on this machine: its
+    /// commits are in the store under its own ref, and its tracker revs in
+    /// the lanes, so the record is used as it stands.
+    fn spawn_from_local_checkpoint(
+        &self,
+        name: &str,
+        from_slug: &str,
+        mut record: CheckpointRecord,
+    ) -> Result<SpawnFromCheckpointOutcome> {
+        let _lock = self.lock_instance(&branch_slug(name), name)?;
+        let checkpoint_id = record.id.clone();
+        let tip = self.source.rev_parse(&record.source.store_ref)?;
+        // The tracker branches start where the checkpoint's committed work
+        // split, as they did for the instance that took it.
+        self.prepare_projection()?;
+        let trackers: Vec<(String, String)> = self
+            .split_view(&record.source.head_rev, &record.dropped)?
+            .index
+            .into_iter()
+            .collect();
+        let mut warnings = Vec::new();
+        for state in &mut record.tracker_states {
+            if let Some(rev) = &state.content_rev
+                && self
+                    .trackers
+                    .iter()
+                    .any(|definition| definition.name == state.name)
+                && !self.lane(&state.name).has_rev(rev)
+            {
+                warnings.push(format!(
+                    "tracker `{}`: its rev {rev} is no longer on this machine",
+                    state.name
+                ));
+                state.content_rev = None;
+            }
+        }
+        record.message = Some(format!("spawned from {from_slug}/{checkpoint_id}"));
+        self.finish_spawn_from_checkpoint(name, record, &tip, &trackers, None, None, warnings)
+    }
+
+    /// [`Self::spawn_from_checkpoint`] of a checkpoint on the project's
+    /// remote.
+    fn spawn_from_remote_checkpoint(
+        &self,
+        name: &str,
+        from_slug: &str,
+        checkpoint_id: &str,
+    ) -> Result<SpawnFromCheckpointOutcome> {
+        let link = self.remote.as_ref().ok_or(NewgitError::NoRemote)?;
         // Held across the spawn and the undo that finishes it: nothing else
         // gets to see the instance half-built.
         let _lock = self.lock_instance(&branch_slug(name), name)?;
         let remote = link.connect(Acting::Login)?;
         let project = link.project.clone();
-        let from_slug = branch_slug(from_instance);
-        let found = remote.checkpoint(&project, &from_slug, checkpoint_id)?;
+        let found = remote.checkpoint(&project, from_slug, checkpoint_id)?;
         let mut record: CheckpointRecord =
             serde_json::from_value(found.record.clone()).map_err(|error| NewgitError::Remote {
                 status: 0,
@@ -3548,15 +4595,13 @@ impl BranchManager {
         let imported = self.import_code(
             remote.as_ref(),
             &project,
-            &from_slug,
+            from_slug,
             checkpoint_id,
             &record.code,
             &mut warnings,
         )?;
         record.source.head_rev = imported.head.clone();
         record.source.dirty_rev = (imported.tip != imported.head).then(|| imported.tip.clone());
-        let imported_ref = format!("refs/newgit/imported/{from_slug}/{checkpoint_id}");
-        self.source.update_ref(&imported_ref, &imported.tip)?;
 
         // Trackers, resolved for whoever is spawning.
         let me = remote.me()?.login;
@@ -3584,33 +4629,6 @@ impl BranchManager {
             }
         }
 
-        let spawned = self.spawn_inner(
-            name,
-            Some(&record.source.head_rev),
-            &BindingChoice::default(),
-            false,
-        )?;
-        let mut branch = spawned.branch.clone();
-        // Its tracker branches start where the checkpoint's committed work is.
-        self.land_tracker_branches(
-            imported
-                .trackers
-                .iter()
-                .map(|(tracker, commit)| (tracker.as_str(), commit.as_str())),
-            &format!("instances/{}", branch.slug),
-        )?;
-
-        // The record joins the new instance's own history, rewritten to
-        // point at what is on this machine.
-        let log = self.checkpoint_log(&branch);
-        record.id = log.next_id()?;
-        record.branch = branch.name.clone();
-        // Taken on the new instance's own branch, which `spawn_inner` made at
-        // the checkpoint's head. The branch the author's workspace was on, or
-        // its detached HEAD, is the author's: the undo below would put this
-        // workspace there (#315).
-        record.source.checked_out = Some(branch.source_ref.clone());
-        record.source.detached = false;
         record.message = Some(format!(
             "spawned from {from_slug}/{checkpoint_id} (by {}{})",
             found.created_by,
@@ -3620,11 +4638,6 @@ impl BranchManager {
                 .map(|agent| format!(", agent {agent}"))
                 .unwrap_or_default()
         ));
-        let store_ref = format!("refs/newgit/checkpoints/{}/{}", branch.slug, record.id);
-        self.source
-            .update_ref(&store_ref, &self.source.rev_parse(&imported_ref)?)?;
-        self.source.delete_ref(&imported_ref)?;
-        record.source.store_ref = store_ref;
         for state in &mut record.resource_states {
             // A deposit's recorded path was on the author's machine; it is the
             // same rev's file here, in this machine's lane checkout cache.
@@ -3646,6 +4659,67 @@ impl BranchManager {
                 });
             }
         }
+        self.finish_spawn_from_checkpoint(
+            name,
+            record,
+            &imported.tip,
+            &imported.trackers,
+            Some(found.created_by),
+            found.agent,
+            warnings,
+        )
+    }
+
+    /// What both spawns from a checkpoint end in, once `record` names
+    /// commits and revs that are on this machine: spawn at its head, land
+    /// its tracker branches, copy it into the new instance's history (`tip`
+    /// kept alive by its ref), undo to it, then autostart.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_spawn_from_checkpoint(
+        &self,
+        name: &str,
+        mut record: CheckpointRecord,
+        tip: &str,
+        trackers: &[(String, String)],
+        author: Option<String>,
+        agent: Option<String>,
+        mut warnings: Vec<String>,
+    ) -> Result<SpawnFromCheckpointOutcome> {
+        let spawned = self.spawn_inner(
+            name,
+            Some(&record.source.head_rev),
+            &BindingChoice::default(),
+            false,
+        )?;
+        let mut branch = spawned.branch.clone();
+        // `spawn_inner` released the slug's lock; take it again before the
+        // record lands, so `newgit cleanup` never sees the ref without its
+        // record (an orphan it would delete) or the record before the undo
+        // stamps what it restored. Re-entrant: the undo takes it too.
+        let _lock = self.lock_instance(&branch.slug, &branch.name)?;
+        // Its tracker branches start where the checkpoint's committed work is.
+        self.land_tracker_branches(
+            trackers
+                .iter()
+                .map(|(tracker, commit)| (tracker.as_str(), commit.as_str())),
+            &format!("instances/{}", branch.slug),
+        )?;
+
+        // The record joins the new instance's own history, rewritten to
+        // point at what is on this machine.
+        let log = self.checkpoint_log(&branch);
+        record.id = log.next_id()?;
+        record.branch = branch.name.clone();
+        record.instance = Some(branch.id.clone());
+        // Taken on the new instance's own branch, which `spawn_inner` made at
+        // the checkpoint's head. The branch the author's workspace was on, or
+        // its detached HEAD, is the author's: the undo below would put this
+        // workspace there (#315).
+        record.source.checked_out = Some(branch.source_ref.clone());
+        record.source.detached = false;
+        let store_ref = format!("refs/newgit/checkpoints/{}/{}", branch.slug, record.id);
+        self.source.update_ref(&store_ref, tip)?;
+        record.source.store_ref = store_ref;
         log.save(&record)?;
 
         let undo = self.undo(
@@ -3666,8 +4740,8 @@ impl BranchManager {
             spawned,
             undo,
             started,
-            author: found.created_by,
-            agent: found.agent,
+            author,
+            agent,
             warnings,
         })
     }
@@ -3718,7 +4792,10 @@ impl BranchManager {
             )
             .map_err(|error| error.to_string())?;
             return match lane.main() {
-                Some(rev) => Ok(Some(rev)),
+                Some(rev) => {
+                    self.note_remote_has(&definition.name, &rev);
+                    Ok(Some(rev))
+                }
                 None => Err(no_own_content(&definition.name)),
             };
         }
@@ -3744,6 +4821,7 @@ impl BranchManager {
             Some(&basic_auth_header(&credential)),
         )
         .map_err(|error| error.to_string())?;
+        self.note_remote_has(&definition.name, &rev_ref);
         Ok(Some(rev.to_owned()))
     }
 
@@ -3751,6 +4829,19 @@ impl BranchManager {
     /// order. Prepare failures are loud but leave the instance spawned —
     /// re-run with `newgit action <resource>.prepare`.
     fn bind_resources(&self, branch: &mut BranchInstance) -> Result<Vec<ResourceBindOutcome>> {
+        self.bind_resources_keeping(branch, None)
+    }
+
+    /// [`Self::bind_resources`], with `rebinding` naming a resource bound
+    /// again and the ports its binding held: each one its definition still
+    /// declares is kept, as a parked binding's are, and only a port declared
+    /// since is allocated. Allocation is for the life of the instance; a
+    /// rebind that moved a port nobody asked to move would be a bug.
+    fn bind_resources_keeping(
+        &self,
+        branch: &mut BranchInstance,
+        rebinding: Option<(&str, &BTreeMap<String, u16>)>,
+    ) -> Result<Vec<ResourceBindOutcome>> {
         let mut outcomes = Vec::new();
 
         for name in &self.graph.bind_order {
@@ -3764,21 +4855,21 @@ impl BranchManager {
 
             // One a drop parked comes back on the ports it had (#255): the
             // files it renders and whatever its `suspend` left on disk or
-            // still running agree on them. Only a definition that has since
-            // changed which ports it declares gets a fresh allocation.
+            // still running agree on them. So does one bound again. Only a
+            // port its definition has declared since is allocated.
             let parked = branch.parked.remove(name);
-            let kept_ports = parked.as_ref().and_then(|parked| {
-                parked
-                    .binding
-                    .resolved_ports
-                    .keys()
-                    .eq(definition.ports.keys())
-                    .then(|| parked.binding.resolved_ports.clone())
-            });
-            let resolved_ports = match kept_ports {
-                Some(ports) => ports,
-                None => self.claim_ports(branch, definition)?,
+            let held = match (&parked, rebinding) {
+                (Some(parked), _) => Some(&parked.binding.resolved_ports),
+                (None, Some((rebound, ports))) if rebound == name => Some(ports),
+                _ => None,
             };
+            let keep: BTreeMap<String, u16> = held
+                .into_iter()
+                .flatten()
+                .filter(|(port, _)| definition.ports.contains_key(*port))
+                .map(|(port, number)| (port.clone(), *number))
+                .collect();
+            let resolved_ports = self.claim_ports(branch, definition, &keep)?;
 
             // An export may compose a dependency's export, the same way a
             // `[[render]]` already can. Bindings happen in dependency order,
@@ -3850,6 +4941,16 @@ impl BranchManager {
                         .is_some_and(|parked| parked.binding.restore_proven),
                     render_error: None,
                     export_error: None,
+                    restore_error: None,
+                    // `resume` brings it back without running `prepare`, so
+                    // what last ran is still what the parked binding ran.
+                    prepare_rev: if resume {
+                        parked
+                            .as_ref()
+                            .and_then(|parked| parked.binding.prepare_rev.clone())
+                    } else {
+                        Some(definition.prepare_rev())
+                    },
                 },
             );
 
@@ -4010,8 +5111,14 @@ impl BranchManager {
                     let log = self
                         .store
                         .action_log_path(&branch.slug, &format!("{}.prepare", definition.name));
-                    let (code, captured) =
-                        self.run_one_shot(branch, definition, action, "prepare", &log, true)?;
+                    let (code, captured) = self.run_one_shot(
+                        branch,
+                        definition,
+                        action,
+                        "prepare",
+                        &log,
+                        OneShot::Hook,
+                    )?;
                     captured_names = captured.found.keys().cloned().collect();
                     missing_captures = Self::missing_capture_warnings(
                         &definition.name,
@@ -4036,6 +5143,11 @@ impl BranchManager {
                     (status, Some((code == 0, log)))
                 }
             };
+            // Bound with nothing to run, or filled from the install store:
+            // up from now, as far as its `[ready]` timeout is counted.
+            if status == ResourceStatus::Ready && prepare.is_none() {
+                self.supervisor(branch).mark_came_up(&definition.name);
+            }
 
             outcomes.push(ResourceBindOutcome {
                 name: definition.name.clone(),
@@ -4074,18 +5186,28 @@ impl BranchManager {
     /// The record is saved as the instance stands, plus this resource bound
     /// `Pending` on the ports just chosen. The caller's own save replaces it
     /// with the finished binding.
+    ///
+    /// `keep` holds ports this instance already claims for the resource
+    /// (a parked or rebound binding's): they are taken as they are, without
+    /// a probe — what holds one may well be this instance's own stack — and
+    /// only the rest are allocated.
     fn claim_ports(
         &self,
         branch: &BranchInstance,
         definition: &ResourceDefinition,
+        keep: &BTreeMap<String, u16>,
     ) -> Result<BTreeMap<String, u16>> {
-        if definition.ports.is_empty() {
-            return Ok(BTreeMap::new());
+        if definition.ports.keys().all(|port| keep.contains_key(port)) {
+            return Ok(keep.clone());
         }
         let _lock = self.store.lock_ports()?;
         let mut used = ports::used_ports(&self.store.load_branches()?);
-        let mut resolved_ports = BTreeMap::new();
+        used.extend(keep.values().copied());
+        let mut resolved_ports = keep.clone();
         for (port_name, request) in &definition.ports {
+            if keep.contains_key(port_name) {
+                continue;
+            }
             resolved_ports.insert(
                 port_name.clone(),
                 ports::allocate(request.start, &mut used)?,
@@ -4103,6 +5225,8 @@ impl BranchManager {
                 restore_proven: false,
                 render_error: None,
                 export_error: None,
+                restore_error: None,
+                prepare_rev: None,
             },
         );
         claim.updated_at = Utc::now();
@@ -4282,20 +5406,12 @@ impl BranchManager {
                 ),
             )?;
             // What the target's own branch holds, as of the last export from
-            // here, so `gh pr create --fill` can list the PR's commits. Not
-            // for a target rooted at a tracker this instance leaves out: no
-            // work of its can go there, and that branch is the tracker's whole
-            // history as exported, with ids of its own, so fetching it is
-            // most of a spawn (192,069 objects for t3code). A `tracker use`
-            // routes again, at the checkpoint that follows.
-            let main = export_ref(&target.name, PROJECT_ROOT_INSTANCE);
-            let left_out = target
-                .root
-                .as_ref()
-                .is_some_and(|root| dropped.contains(root));
+            // here, so `gh pr create --fill` can list the PR's commits. A
+            // spawn's workspace already has its objects, carried by the
+            // source template, so this fetch transfers nothing; elsewhere
+            // (a `tracker use`, a clone without the template) it does.
             if workspace != self.store.paths().project_root.as_str()
-                && !left_out
-                && self.source.rev_parse(&main).is_ok()
+                && let Some(main) = self.routed_export_main(target, dropped)
             {
                 crate::source::run_git_env(
                     &[
@@ -4312,6 +5428,40 @@ impl BranchManager {
             }
         }
         Ok(())
+    }
+
+    /// The store ref holding `target`'s own branch, when a workspace with
+    /// `dropped` left out gets it as `refs/remotes/<target>/<branch>`. Not
+    /// for a target that exports no instance branches, or one rooted at a
+    /// tracker the instance leaves out: no work of its can go there, and
+    /// that branch is the tracker's whole history as exported, with ids of
+    /// its own (236,000 objects for t3code). A `tracker use` routes again,
+    /// at the checkpoint that follows.
+    fn routed_export_main(
+        &self,
+        target: &ExportTarget,
+        dropped: &BTreeSet<String>,
+    ) -> Option<String> {
+        let left_out = target
+            .root
+            .as_ref()
+            .is_some_and(|root| dropped.contains(root));
+        let main = export_ref(&target.name, PROJECT_ROOT_INSTANCE);
+        (target.branches && !left_out && self.source.rev_parse(&main).is_ok()).then_some(main)
+    }
+
+    /// The export branches a new workspace's source template carries for
+    /// it: what [`Self::route_export_remotes`] will fetch once the instance
+    /// is on the remote. None without one, since nothing is routed then.
+    fn export_mains_to_carry(&self, dropped: &BTreeSet<String>) -> Vec<String> {
+        if self.remote.is_none() {
+            return Vec::new();
+        }
+        self.export_targets()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|target| self.routed_export_main(target, dropped))
+            .collect()
     }
 
     /// The trackers in Git the instance's work touched: those whose
@@ -5270,10 +6420,12 @@ impl BranchManager {
     }
 
     /// `newgit resource rebind`: bind `resource` again in `instance`, as
-    /// spawn bound it: claim its ports, resolve its exports, render its
-    /// files, run its `prepare`, then start its `autostart` action. The
+    /// spawn bound it: keep the ports it holds that its definition still
+    /// declares and claim any declared since, resolve its exports, render
+    /// its files, run its `prepare`, then start its `autostart` action. The
     /// retry for a bind that failed where no action reaches, a render or an
-    /// export, once the file or the definition is fixed (#262).
+    /// export, once the file or the definition is fixed (#262), and how a
+    /// live instance takes up an edited definition (#85).
     ///
     /// Refused while its process runs: binding again moves the values that
     /// process was started with.
@@ -5295,9 +6447,15 @@ impl BranchManager {
             )));
         }
         let autostart = definition.autostart_action().is_some();
+        // Not saved without it: the record on disk goes on claiming its
+        // ports until the bind writes the new claim, so no other spawn can
+        // take one of the ports it keeps in between.
         let previous = branch.resources.remove(resource);
-        self.store.save_branch_record(&branch)?;
-        let bound = match self.bind_resources(&mut branch) {
+        let held = previous
+            .as_ref()
+            .map(|binding| binding.resolved_ports.clone())
+            .unwrap_or_default();
+        let bound = match self.bind_resources_keeping(&mut branch, Some((resource, &held))) {
             Ok(bound) => bound,
             Err(error) => {
                 // Put the old binding back, so a bind that fails before it
@@ -5334,6 +6492,17 @@ impl BranchManager {
 
     /// Run `<resource>.<action>` for an instance.
     pub fn run_action(&self, instance: &str, spec: &str) -> Result<ActionOutcome> {
+        self.run_action_with(instance, spec, false)
+    }
+
+    /// [`Self::run_action`], with a one-shot command's output going to its
+    /// log only rather than to the terminal as well (#89): the caller says
+    /// how it went, as spawn does for a `prepare`.
+    pub fn run_action_quiet(&self, instance: &str, spec: &str) -> Result<ActionOutcome> {
+        self.run_action_with(instance, spec, true)
+    }
+
+    fn run_action_with(&self, instance: &str, spec: &str, quiet: bool) -> Result<ActionOutcome> {
         let (_lock, _) = self.locked_branch(instance)?;
         let (mut branch, definition, action, action_name) = self.resolve_action(instance, spec)?;
         let supervisor = self.supervisor(&branch);
@@ -5352,6 +6521,16 @@ impl BranchManager {
             .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
 
         if action.long_running {
+            // By hand as at spawn: not against a dependency that is down or
+            // not answering yet (#54).
+            self.await_dependencies(
+                &branch,
+                definition,
+                action_name,
+                &supervisor,
+                &mut BTreeSet::new(),
+            )
+            .map_err(NewgitError::Unsupported)?;
             let (command, cwd) =
                 self.action_invocation(&branch, definition, action, action_name)?;
             let env = self.assemble_env(&branch)?;
@@ -5359,8 +6538,14 @@ impl BranchManager {
             return Ok(ActionOutcome::Started { pid, log });
         }
 
-        let (code, captured) =
-            self.run_one_shot(&branch, definition, action, action_name, &log, false)?;
+        let (code, captured) = self.run_one_shot(
+            &branch,
+            definition,
+            action,
+            action_name,
+            &log,
+            OneShot::Asked { quiet },
+        )?;
         let missing_captures =
             Self::missing_capture_warnings(&definition.name, action_name, &captured, &log);
         let mut dirty = Self::apply_captures(&mut branch, &definition.name, captured.found);
@@ -5372,6 +6557,10 @@ impl BranchManager {
             } else {
                 ResourceStatus::Failed
             };
+            if code == 0 {
+                binding.prepare_rev = Some(definition.prepare_rev());
+                binding.restore_error = None;
+            }
             dirty = true;
         }
         if dirty {
@@ -5512,23 +6701,34 @@ impl BranchManager {
         action: &crate::resource::ActionSpec,
         action_name: &str,
         log: &Utf8Path,
-        quiet: bool,
+        run: OneShot,
     ) -> Result<(i32, Captures)> {
         let (command, cwd) = self.action_invocation(branch, definition, action, action_name)?;
         let env = self.assemble_env(branch)?;
+        let input = match run {
+            OneShot::Hook => crate::supervisor::Input::Closed,
+            OneShot::Asked { .. } => crate::supervisor::Input::Inherit,
+        };
 
-        if action.captures.is_empty() {
+        let (code, captures) = if action.captures.is_empty() {
             let command_line = ["sh".to_owned(), "-c".to_owned(), command];
-            let code = if quiet {
-                crate::supervisor::run_quiet(&command_line, &cwd, &env, log)?
-            } else {
+            let code = if run == (OneShot::Asked { quiet: false }) {
                 run_foreground(&command_line, &cwd, &env, log)?
+            } else {
+                crate::supervisor::run_quiet(&command_line, &cwd, &env, log, input)?
             };
-            return Ok((code, Captures::default()));
+            (code, Captures::default())
+        } else {
+            let (code, stdout) =
+                crate::supervisor::run_captured_with(&command, &cwd, &env, log, input)?;
+            (code, parse_captures(&stdout, &action.captures))
+        };
+        // What brings up a resource newgit does not supervise: its
+        // `[ready]` timeout is counted from here (#276).
+        if code == 0 && matches!(action_name, "prepare" | "resume") {
+            self.supervisor(branch).mark_came_up(&definition.name);
         }
-
-        let (code, stdout) = run_captured(&command, &cwd, &env, log)?;
-        Ok((code, parse_captures(&stdout, &action.captures)))
+        Ok((code, captures))
     }
 
     /// One warning per declared capture the command never emitted. The log
@@ -5981,6 +7181,7 @@ impl BranchManager {
                     .get(&definition.name)
                     .and_then(|binding| binding.content_rev.clone());
                 let reversed = self.unrender_for_capture(branch, definition)?;
+                let seal = self.seal_for(definition, Some(branch))?;
                 let safety = lane.capture(
                     &workspace,
                     definition,
@@ -5991,6 +7192,7 @@ impl BranchManager {
                             "{} in `{}`, before re-binding",
                             definition.name, branch.name
                         ),
+                        seal: seal.as_ref(),
                     },
                 );
                 reversed.restore()?;
@@ -5998,6 +7200,19 @@ impl BranchManager {
             }
         }
 
+        // Nothing merged here yet (a clone): the remote's `main`, if it has
+        // one. A spawn with no network still binds, with nothing.
+        let mut warnings = Vec::new();
+        if !refresh
+            && lane.main().is_none()
+            && let Err(error) = self.bring_remote_main(definition, Acting::Workspace(&workspace))
+        {
+            warnings.push(format!(
+                "tracker `{}`: could not bring its `main` from the remote ({error}); `newgit \
+                 tracker pull {}` brings it later",
+                definition.name, definition.name
+            ));
+        }
         let (origin, content_rev, files) = match lane.main() {
             Some(rev) => {
                 let files = lane.restore(&workspace, definition, &rev)?;
@@ -6016,7 +7231,7 @@ impl BranchManager {
         branch.updated_at = Utc::now();
 
         Ok(TrackerBindOutcome {
-            warnings: Vec::new(),
+            warnings,
             name: definition.name.clone(),
             content_rev,
             files,
@@ -6712,6 +7927,9 @@ impl BranchManager {
             };
             if let Some(binding) = branch.resources.get_mut(name) {
                 binding.status = status;
+                // Its state is now what this rebuild made, whatever an
+                // earlier restore failed to make.
+                binding.restore_error = None;
             }
             branch.updated_at = Utc::now();
             self.store.save_branch_record(&branch)?;
@@ -6746,7 +7964,7 @@ impl BranchManager {
             .store
             .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
         let (code, captured) =
-            self.run_one_shot(branch, definition, action, action_name, &log, true)?;
+            self.run_one_shot(branch, definition, action, action_name, &log, OneShot::Hook)?;
         Self::apply_captures(branch, &definition.name, captured.found);
         let ok = code == 0;
         let install = match (&install_key, filled) {
@@ -6895,6 +8113,13 @@ impl BranchManager {
             .get(&definition.name)
             .and_then(|binding| binding.content_rev.clone());
         let lane = self.lane(&definition.name);
+        let seal = match self.seal_for(definition, Some(&branch)) {
+            Ok(seal) => seal,
+            Err(error) => {
+                reversed.restore()?;
+                return Err(error);
+            }
+        };
         let capture = lane.capture(
             &branch.workspace_path,
             definition,
@@ -6902,6 +8127,7 @@ impl BranchManager {
                 parent: previous.as_deref(),
                 branch: Branch::Instance(&branch.slug),
                 message: &format!("{} in `{}`", definition.name, branch.name),
+                seal: seal.as_ref(),
             },
         );
         reversed.restore()?;
@@ -6962,6 +8188,7 @@ impl BranchManager {
 
         let lane = self.lane(&definition.name);
         let main = lane.main();
+        let seal = self.seal_for(definition, None)?;
         let capture = lane.capture(
             &root,
             definition,
@@ -6969,6 +8196,7 @@ impl BranchManager {
                 parent: main.as_deref(),
                 branch: Branch::Main,
                 message: &format!("{} seeded from the project", definition.name),
+                seal: seal.as_ref(),
             },
         )?;
         let changed = capture.committed;
@@ -7020,6 +8248,13 @@ impl BranchManager {
             .trackers
             .get(&definition.name)
             .and_then(|binding| binding.content_rev.clone());
+        let seal = match self.seal_for(definition, Some(&branch)) {
+            Ok(seal) => seal,
+            Err(error) => {
+                reversed.restore()?;
+                return Err(error);
+            }
+        };
         let safety = lane.capture(
             &branch.workspace_path,
             definition,
@@ -7030,6 +8265,7 @@ impl BranchManager {
                     "{} in `{}`, before checking out {target_rev}",
                     definition.name, branch.name
                 ),
+                seal: seal.as_ref(),
             },
         );
         reversed.restore()?;
@@ -7065,6 +8301,9 @@ impl BranchManager {
         let definition = self.definition(tracker)?;
         self.require_workspace(&branch)?;
 
+        // The remote's `main` first, when it keeps one: a clone, or a
+        // machine that has not seen the latest merge, pulls what is there.
+        self.bring_remote_main(definition, Acting::Workspace(&branch.workspace_path))?;
         if self.lane(&definition.name).main().is_none() {
             return Err(NewgitError::Unsupported(format!(
                 "tracker `{}` has no merged content to pull",
@@ -7076,6 +8315,100 @@ impl BranchManager {
         outcome.warnings = self.rerender_all(&mut branch);
         self.store.save_branch_record(&branch)?;
         Ok(outcome)
+    }
+
+    /// Take mine, on top of theirs: what `newgit tracker pull --keep-mine`
+    /// does when a merge was refused because the remote's `main` moved on.
+    /// This instance's files are captured, `main` (the remote's, when it
+    /// keeps one) is pulled, and the captured version is put back over it
+    /// and captured again, on top of `main`, so `newgit tracker merge` is a
+    /// fast forward of it. There is no content merge: "mine" is this
+    /// instance's whole version of the tracker's files. Every file it has
+    /// replaces `main`'s, and a file it deleted since the rev it started
+    /// from (the newest rev its capture and `main` share) is deleted again,
+    /// even where `main` changed it. Files only `main` added stay. When the
+    /// two share no rev, deletions cannot be told apart from files `main`
+    /// added, so every file only `main` has stays, and [`KeptMine::base`]
+    /// is `None` to say so.
+    pub fn pull_tracker_keep_mine(&self, instance: &str, tracker: &str) -> Result<KeptMine> {
+        let mine = self.capture_tracker(instance, tracker)?.rev;
+        let definition = self.definition(tracker)?;
+        let name = definition.name.clone();
+        let mine_kept = |error: NewgitError| {
+            NewgitError::Unsupported(format!(
+                "{error}. Your version of `{name}` is captured at {mine}: `newgit tracker \
+                 checkout {name} --rev {mine}` puts it back in the workspace"
+            ))
+        };
+        self.pull_tracker(instance, tracker).map_err(mine_kept)?;
+        self.keep_mine_over_main(instance, definition, &mine)
+            .map_err(mine_kept)
+    }
+
+    fn keep_mine_over_main(
+        &self,
+        instance: &str,
+        definition: &TrackerDefinition,
+        mine: &str,
+    ) -> Result<KeptMine> {
+        let lane = self.lane(&definition.name);
+        let main = lane.main();
+        let base = main.as_deref().and_then(|main| lane.merge_base(mine, main));
+        let mut replaced = 0;
+        let mut deleted = Vec::new();
+        {
+            let (_lock, mut branch) = self.locked_branch(instance)?;
+            let dir = lane.checkout_dir(mine)?;
+            let mut have = BTreeSet::new();
+            for (relative, absolute) in crate::tracker::collect_all_files(&dir)? {
+                if !definition.owns(&relative) {
+                    continue;
+                }
+                have.insert(relative.to_string());
+                let target = branch.workspace_path.join(&relative);
+                let same = match (std::fs::read(&absolute), std::fs::read(&target)) {
+                    (Ok(ours), Ok(theirs)) => ours == theirs,
+                    _ => false,
+                };
+                if same {
+                    continue;
+                }
+                if std::fs::symlink_metadata(&target).is_ok() {
+                    std::fs::remove_file(&target)
+                        .map_err(|source| NewgitError::io(&target, source))?;
+                }
+                crate::tracker_repo::copy_file(&absolute, &target)?;
+                replaced += 1;
+            }
+            // What this instance deleted since the rev it started from is
+            // part of its version: deleted again, whatever `main` did to it.
+            if let Some(base) = &base {
+                for relative in lane.files_at(base)? {
+                    if have.contains(&relative) || !definition.owns(Utf8Path::new(&relative)) {
+                        continue;
+                    }
+                    let target = branch.workspace_path.join(&relative);
+                    if std::fs::symlink_metadata(&target).is_ok() {
+                        std::fs::remove_file(&target)
+                            .map_err(|source| NewgitError::io(&target, source))?;
+                        deleted.push(relative);
+                    }
+                }
+            }
+            // Committed content again; this instance's values go back on
+            // top, and the capture below takes them off.
+            self.rerender_all(&mut branch);
+            self.store.save_branch_record(&branch)?;
+        }
+        let rev = self.capture_tracker(instance, &definition.name)?.rev;
+        Ok(KeptMine {
+            mine: mine.to_owned(),
+            main,
+            base,
+            rev,
+            files: replaced,
+            deleted,
+        })
     }
 
     /// Promote this branch instance's bound tracker revision to the lane head.
@@ -7099,56 +8432,34 @@ impl BranchManager {
                 rev,
             });
         }
+        // Encrypted to its audience: `main` is encrypted to who reads it now,
+        // as the remote lists them, which may have changed since the
+        // capture (#338).
+        let rev = self.sealed_to_current(
+            definition,
+            &rev,
+            Some(&branch),
+            Branch::Instance(&branch.slug),
+            &format!(
+                "{} in `{}`, encrypted to its audience",
+                definition.name, branch.name
+            ),
+        )?;
         // The remote first: a merge that did not reach it fails whole,
         // rather than leaving `main` moved on this machine only.
-        let published = self.publish_tracker_main(&branch, definition, &rev)?;
+        let published =
+            self.publish_main(definition, &rev, Acting::Workspace(&branch.workspace_path))?;
         lane.set_main(&rev)?;
+        let (published, capped) = match published {
+            Some((project, capped)) => (Some(project), capped),
+            None => (None, None),
+        };
         Ok(MergeTrackerOutcome {
             tracker: definition.name.clone(),
             rev,
             published,
+            capped,
         })
-    }
-
-    /// Move the remote's `main` for a shared tracker whose synced state lives
-    /// there (`storage = "remote"`) to `rev`. A checkpoint's sync pushes only
-    /// such a tracker's pins and instance branches, never its `main`, so this
-    /// is the one way that `main` moves.
-    ///
-    /// On the remote a tracker repo's `main` is its branch `main`, as that of a
-    /// tracker in Git is: the repo's default branch, what the Worker's
-    /// `LANDING_PAGE` reads, and what anything reading a tracker by branch
-    /// gets. A per-user tracker's `main` already rides every checkpoint.
-    ///
-    /// Forced, so of two merges at once the last wins; the rev it replaces
-    /// stays on the remote under its pin and its instance branch. A lease
-    /// would refuse instead, but nothing fetches the remote's `main` back
-    /// into this machine's yet, so a refused merge would have no way to
-    /// catch up. The lease comes with that fetch.
-    fn publish_tracker_main(
-        &self,
-        branch: &BranchInstance,
-        definition: &TrackerDefinition,
-        rev: &str,
-    ) -> Result<Option<String>> {
-        if definition.storage != Storage::Remote || definition.audience == "user" {
-            return Ok(None);
-        }
-        let Some(link) = &self.remote else {
-            return Ok(None);
-        };
-        let remote = link.connect(Acting::Workspace(&branch.workspace_path))?;
-        let repo = tracker_repo(&link.project, definition, "");
-        let credential = remote.credential(&link.project, &repo, Scope::Write)?;
-        let url = credential.remote.clone().unwrap_or_default();
-        let pin = format!("refs/trackers/{}/pins/{rev}", definition.name);
-        GitSource::push_refs(
-            &[&format!("--git-dir={}", self.store.paths().tracker_store)],
-            &url,
-            &[format!("{pin}:{pin}"), format!("+{pin}:refs/heads/main")],
-            Some(&basic_auth_header(&credential)),
-        )?;
-        Ok(Some(link.project.clone()))
     }
 
     pub fn create_tracker(
@@ -7157,6 +8468,18 @@ impl BranchManager {
         audience: &str,
         storage: Storage,
         merge_with_source: bool,
+    ) -> Result<AddTrackerOutcome> {
+        self.create_tracker_in_role(name, audience, storage, merge_with_source, None)
+    }
+
+    /// [`Self::create_tracker`], filling `role` when one is given.
+    pub fn create_tracker_in_role(
+        &self,
+        name: &str,
+        audience: &str,
+        storage: Storage,
+        merge_with_source: bool,
+        role: Option<&str>,
     ) -> Result<AddTrackerOutcome> {
         validate_name(name)?;
         if !crate::tracker::name_fits_id(name) {
@@ -7180,10 +8503,141 @@ impl BranchManager {
             merge_with_source,
             Vec::new(),
         )?;
+        let definition = match role {
+            Some(role) => definition.with_role(role)?,
+            None => definition,
+        };
         let path = self.store.create_tracker_definition(&definition)?;
         Ok(AddTrackerOutcome {
             path,
             ignored_patterns: Vec::new(),
+        })
+    }
+
+    /// A tracker outside Git whose history starts at `upstream`'s: a fork,
+    /// so the members of a role share history and can merge with each other
+    /// (docs/design/trackers.md, *Roles are forks*). It claims what
+    /// `upstream` claims and fills its role, and its definition says `from`.
+    /// Locally every tracker is in one store, so its `main` and a pin are
+    /// two refs at `upstream`'s `main`: nothing is copied.
+    ///
+    /// Its audience defaults to `upstream`'s and may be narrower, never
+    /// wider: refused, naming both. Its storage defaults to `upstream`'s.
+    /// With no role on `upstream`, `role` is required and is written to
+    /// `upstream` as well, so the two are alternatives.
+    pub fn fork_tracker(
+        &self,
+        name: &str,
+        upstream: &str,
+        audience: Option<&str>,
+        storage: Option<Storage>,
+        role: Option<&str>,
+        merge_with_source: bool,
+    ) -> Result<ForkTrackerOutcome> {
+        validate_name(name)?;
+        if !crate::tracker::name_fits_id(name) {
+            return Err(NewgitError::InvalidName(name.to_owned()));
+        }
+        self.refuse_root(name, "it always exists")?;
+        let path = self.store.paths().trackers.join(format!("{name}.toml"));
+        if path.exists() || self.all_definitions().iter().any(|d| d.name == name) {
+            return Err(NewgitError::AlreadyExists(path));
+        }
+        let from = match self
+            .all_definitions()
+            .into_iter()
+            .find(|d| d.name == upstream)
+        {
+            Some(from) => from,
+            None => return Err(NewgitError::UnknownTracker(upstream.to_owned())),
+        };
+        let shown = tracker_path(&from.name);
+        if from.git {
+            return Err(NewgitError::Unsupported(format!(
+                "`{shown}` is a tracker in Git, and only a tracker outside Git can be forked yet: \
+                 members of a role are alternatives, and every instance holds every tracker in \
+                 Git, so two at one mount would both be in its view"
+            )));
+        }
+        let audience = audience.unwrap_or(&from.audience).to_owned();
+        if !crate::tracker::audience_within(&audience, &from.audience) {
+            return Err(NewgitError::Unsupported(format!(
+                "a fork can't be readable by anyone its upstream isn't: `{name}` would be \
+                 `{audience}`, wider than `{shown}`'s `{}`, and its history would hold all of \
+                 `{shown}`'s. Give it `--audience {}` or a narrower one",
+                from.audience, from.audience
+            )));
+        }
+        let storage = storage.unwrap_or(from.storage);
+        if storage == Storage::Remote && self.config.remote.is_none() {
+            return Err(NewgitError::Unsupported(format!(
+                "tracker `{name}` would use `storage = \"remote\"`, but .newgit/config.toml has \
+                 no [remote] to sync it to; add one, or fork with `--storage local`"
+            )));
+        }
+        let role = match (role, from.role.as_deref()) {
+            (Some(asked), Some(theirs)) if asked != theirs => {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{shown}` fills role `{theirs}`, and a fork fills its upstream's role (it \
+                     claims the same paths): `--role {theirs}`, or leave `--role` out"
+                )));
+            }
+            (_, Some(theirs)) => theirs.to_owned(),
+            (Some(asked), None) => asked.to_owned(),
+            (None, None) => {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{shown}` fills no role, and a fork claims the same paths as its upstream, \
+                     which only members of one role may: name the role they both fill, \
+                     `newgit tracker create {name} --from {shown} --role <role>`"
+                )));
+            }
+        };
+        let lane = self.lane(&from.name);
+        if lane.main().is_none() {
+            return Err(NewgitError::Unsupported(format!(
+                "`{shown}` has no history yet (nothing merged to its `main`), so a fork would \
+                 share nothing with it: capture and merge it first (`newgit tracker capture \
+                 {shown}`, then `newgit tracker merge {shown}`)"
+            )));
+        }
+        let fork = from.fork_as(name, audience, storage, merge_with_source, role.clone())?;
+        let upstream_role_added = from.role.is_none();
+        let upstream_updated = if upstream_role_added {
+            Some(from.with_role(&role)?)
+        } else {
+            None
+        };
+        let mut all: Vec<TrackerDefinition> = self
+            .all_definitions()
+            .into_iter()
+            .map(|existing| match &upstream_updated {
+                Some(updated) if updated.name == existing.name => updated.clone(),
+                _ => existing,
+            })
+            .collect();
+        all.push(fork.clone());
+        crate::tracker::resolve_ownership(&mut all)?;
+
+        let path = self.store.create_tracker_definition(&fork)?;
+        if let Some(updated) = &upstream_updated {
+            self.store.save_tracker_definition(updated)?;
+        }
+        crate::tracker_repo::record_fork(&self.store.paths().tracker_store, name, &from.name)?;
+        let forked = self.lane(name);
+        let main = forked.fork_from(&lane)?.ok_or_else(|| {
+            NewgitError::Unsupported(format!("`{shown}`'s `main` went away while forking it"))
+        })?;
+        Ok(ForkTrackerOutcome {
+            path,
+            upstream: from.name.clone(),
+            audience: fork.audience.clone(),
+            storage,
+            role,
+            upstream_role_added,
+            priority: fork.priority,
+            main,
+            commits: forked.main_commits(),
+            paths: fork.paths.clone(),
         })
     }
 
@@ -7247,6 +8701,31 @@ impl BranchManager {
                 ))
             })?;
 
+        // Named by `from`, or recorded as having started at it: either way
+        // its audience is a ceiling on theirs.
+        let records = crate::tracker_repo::fork_records(&self.store.paths().tracker_store)
+            .unwrap_or_default();
+        let forks: Vec<String> = self
+            .all_definitions()
+            .iter()
+            .filter(|other| {
+                other.from.as_deref() == Some(name)
+                    || records
+                        .iter()
+                        .any(|(fork, upstream)| fork == &other.name && upstream == name)
+            })
+            .map(|other| format!("`{}`", tracker_path(&other.name)))
+            .collect();
+        if !forks.is_empty() {
+            return Err(NewgitError::Unsupported(format!(
+                "{} {} a fork of `{name}`, whose audience is the ceiling on {}: remove {} first",
+                forks.join(", "),
+                if forks.len() == 1 { "is" } else { "are" },
+                if forks.len() == 1 { "its" } else { "theirs" },
+                if forks.len() == 1 { "it" } else { "them" },
+            )));
+        }
+
         let branches = self.store.load_branches()?;
         let bound: Vec<&str> = branches
             .iter()
@@ -7278,6 +8757,7 @@ impl BranchManager {
         let gitignore_removed = self.store.remove_gitignore_block(name)?;
 
         let path = self.store.delete_tracker_definition(name)?;
+        crate::tracker_repo::forget_fork(&self.store.paths().tracker_store, name)?;
         Ok(RemoveTrackerOutcome {
             path,
             gitignore_removed,
@@ -7307,17 +8787,31 @@ impl BranchManager {
     }
 
     pub fn statuses(&self) -> Result<Vec<InstanceReport>> {
+        self.statuses_of(None)
+    }
+
+    /// [`Self::statuses`] of the instance named `name` (by name or slug)
+    /// alone, when given: only its `[ready]` checks run, not every
+    /// instance's (#276).
+    pub fn statuses_of(&self, name: Option<&str>) -> Result<Vec<InstanceReport>> {
         let lane_heads: Vec<(String, Option<String>)> = self
             .trackers
             .iter()
             .map(|definition| (definition.name.clone(), self.lane(&definition.name).main()))
             .collect();
 
-        self.store
-            .load_branches()?
-            .into_iter()
+        // Each instance is a handful of `git` spawns and file reads, all
+        // independent of every other instance's: done side by side, a project
+        // with a hundred instances answers in the time of a few.
+        use rayon::prelude::*;
+        let mut branches = self.store.load_branches()?;
+        if let Some(name) = name {
+            branches.retain(|branch| branch.name == name || branch.slug == name);
+        }
+        branches
+            .into_par_iter()
             .map(|branch| {
-                let workspace_exists = branch.workspace_path.is_dir();
+                let workspace_exists = branch.workspace_path.is_dir() && branch.evicted.is_none();
                 let live_rev = workspace_exists
                     .then(|| GitSource::workspace_short_head(&branch.workspace_path).ok())
                     .flatten();
@@ -7340,10 +8834,20 @@ impl BranchManager {
                             .iter()
                             .find(|(name, _)| name == &definition.name)
                             .and_then(|(_, head)| head.clone());
+                        // Re-encrypted to another set of recipients is still
+                        // the same content; not knowing (no key) is not.
+                        let same_content = match (&content_rev, &head) {
+                            (Some(bound), Some(head)) if bound != head => self
+                                .lane(&definition.name)
+                                .same_content(bound, head)
+                                .unwrap_or(false),
+                            _ => false,
+                        };
                         TrackerReport {
                             name: definition.name.clone(),
                             content_rev,
                             lane_head: head,
+                            same_content,
                         }
                     })
                     .collect();
@@ -7384,6 +8888,10 @@ impl BranchManager {
                                         format!("blocked({})", blocked_by.join(","))
                                     } else if binding.status == ResourceStatus::Pending {
                                         "pending".to_owned()
+                                    } else if definition.autostart_action().is_some() {
+                                        // Ready, and what spawn starts for it
+                                        // never started (#54): not `ready`.
+                                        "not started".to_owned()
                                     } else {
                                         "ready".to_owned()
                                     }
@@ -7443,7 +8951,22 @@ impl BranchManager {
         checkpoints: ArchivedCheckpoints,
         source_branch: SourceBranchPolicy,
     ) -> Result<RemoveOutcome> {
-        let (_lock, branch) = self.locked_branch(name)?;
+        self.remove_forced(name, cwd, checkpoints, source_branch, false)
+    }
+
+    /// [`Self::remove`]; `force` also deletes what was written at an
+    /// evicted instance's workspace path since, which no checkpoint holds
+    /// and which `remove` otherwise refuses to delete, and removes the
+    /// instance when the checkpoint taken first fails.
+    pub fn remove_forced(
+        &self,
+        name: &str,
+        cwd: &Utf8Path,
+        checkpoints: ArchivedCheckpoints,
+        source_branch: SourceBranchPolicy,
+        force: bool,
+    ) -> Result<RemoveOutcome> {
+        let (_lock, mut branch) = self.locked_branch(name)?;
 
         if cwd.starts_with(&branch.workspace_path) {
             return Err(NewgitError::Unsupported(format!(
@@ -7452,10 +8975,54 @@ impl BranchManager {
                 branch.name
             )));
         }
+        // An evicted instance's workspace path holds only its marker, unless
+        // something was written there after a restore failed or was cut
+        // short; no checkpoint holds that.
+        if branch.evicted.is_some()
+            && branch.workspace_path.exists()
+            && !crate::materializer::is_evicted_stub(&branch.workspace_path)
+            && !force
+        {
+            let mut held: Vec<String> = std::fs::read_dir(&branch.workspace_path)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .filter(|name| name != ".newgit")
+                        .collect()
+                })
+                .unwrap_or_default();
+            held.sort();
+            return Err(NewgitError::Unsupported(format!(
+                "not removing `{}`: it is evicted, and {} holds more than its marker ({}), \
+                 written since and in no checkpoint, which `remove` would delete. Move what you \
+                 want to keep out of it, or `newgit remove {} --force` deletes it",
+                branch.name,
+                branch.workspace_path,
+                if held.is_empty() {
+                    "under `.newgit/`".to_owned()
+                } else {
+                    held.iter()
+                        .take(8)
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+                branch.name
+            )));
+        }
         // Whatever would make the cleanup hooks refuse refuses here, before
         // anything is stopped or deleted: a dry run checks each hook and runs
         // none.
-        self.run_cleanup_hooks(&branch, true)?;
+        self.run_cleanup_hooks(&branch, true, &BTreeMap::new())?;
+
+        // Before anything is stopped: a checkpoint of everything a
+        // checkpoint holds, with what is running still running, so that
+        // removing never deletes work no checkpoint holds. It takes the
+        // workspace's commits into the store, so the branch decision below
+        // sees them.
+        let keeping = checkpoints == ArchivedCheckpoints::Keep;
+        let keep = self.checkpoint_before_remove(&mut branch, keeping, force)?;
 
         let policy = source_branch;
         let (mut source_branch, via_outbox) = self.decide_source_branch(&branch, policy)?;
@@ -7466,8 +9033,22 @@ impl BranchManager {
         for definition in self.running_resources(&branch) {
             supervisor.stop(&definition.name, &definition.stop_signal())?;
         }
+        // And one whose definition was deleted by hand: nothing else will
+        // ever stop it, and it holds its ports after the record is gone.
+        for orphan in self.stop_undefined(&branch) {
+            if let Some(error) = orphan.error {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{}`'s process, whose definition is gone, did not stop: {error}",
+                    orphan.name
+                )));
+            }
+        }
 
-        let hooks = self.run_cleanup_hooks(&branch, false)?;
+        // Never the cleanup of a resource the checkpoint could not capture:
+        // its state is in no checkpoint, and its `[cleanup]` (a `dropdb`)
+        // would delete it. It stays where it is, and the outcome says so.
+        let hooks = self.run_cleanup_hooks(&branch, false, &keep.uncaptured)?;
+        let left = left_state(&hooks, &keep.uncaptured);
 
         let state_dir = self.store.instance_state_dir(&branch.slug);
         if state_dir.exists() {
@@ -7488,6 +9069,21 @@ impl BranchManager {
         };
 
         self.materializer().remove(&branch)?;
+        // What an eviction kept of its Git, and a workspace it left half
+        // deleted.
+        crate::evict::clear_saved(self.source.root(), &branch.slug)?;
+        let trash = self.evict_trash(&branch);
+        if std::fs::symlink_metadata(&trash).is_ok() {
+            crate::evict::delete_tree(&trash).map_err(|source| NewgitError::io(trash, source))?;
+        }
+        // Saved copies are the user's work, in no checkpoint: kept, and
+        // named, since the record that listed them is archived.
+        let saved_copies: Vec<Utf8PathBuf> = branch
+            .saved_copies
+            .iter()
+            .filter(|copy| std::fs::symlink_metadata(copy).is_ok())
+            .cloned()
+            .collect();
         // Its branches go with it; pins keep whatever its archived
         // checkpoints still name.
         for definition in &self.trackers {
@@ -7500,15 +9096,36 @@ impl BranchManager {
                 &format!("instances/{}", branch.slug),
             ));
         }
+        // And newgit's record of what it last pushed of its branch to each
+        // export target: an instance spawned again under the name is another
+        // instance, and may not replace what this one left there.
+        let pushed = format!("pushed-branches/{}", branch.slug);
+        for name in self.source.refs_under(EXPORTS_REFS)? {
+            let ours = name
+                .strip_prefix(EXPORTS_REFS)
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(_, rest)| rest == pushed);
+            if ours {
+                let _ = self.source.delete_ref(&name);
+            }
+        }
+        if let Some(id) = &keep.checkpoint {
+            branch.removed_to = Some(id.clone());
+            branch.updated_at = Utc::now();
+            self.store.save_branch_record(&branch)?;
+        }
         let archived_record = self.store.archive_branch_record(&branch)?;
         // Either way, count what the instance leaves behind: checkpoints kept
         // for an unreachable instance are disk nobody will reclaim by accident.
-        let keeping = checkpoints == ArchivedCheckpoints::Keep;
-        let found = self.purge_checkpoints(&branch.slug, keeping)?;
+        let found = self.purge_checkpoints(&branch.slug, Some(&branch.id), keeping)?;
         let (purged_checkpoints, kept_checkpoints) = match (keeping, found) {
             (true, found) => (None, found.map_or(0, |plan| plan.checkpoints)),
             (false, purged) => (purged, 0),
         };
+        // And the plaintext this machine kept of what it decrypted for it
+        // (#338): only what a live instance or `main` holds stays cached.
+        // Its archived checkpoints still decrypt, with a key, if restored.
+        crate::tracker_repo::prune_plain_cache(&self.store.paths().tracker_store)?;
 
         // Last, so an error anywhere above leaves the branch untouched. By
         // now the record is archived and the removal has happened, so
@@ -7525,9 +9142,15 @@ impl BranchManager {
             hooks,
             purged_checkpoints,
             kept_checkpoints,
+            checkpoint: keep.checkpoint,
+            disposed: keep.disposed,
+            lost: keep.lost,
+            left,
+            warnings: keep.warnings,
             remote_warning,
             source_branch,
             unsaved_workspace_head,
+            saved_copies,
         })
     }
 
@@ -7739,7 +9362,14 @@ impl BranchManager {
         })
     }
 
-    /// Drop one instance's checkpoint log and the store refs it held.
+    /// Drop a name's checkpoint log and the store refs it held: all of it
+    /// (`cleanup --purge-archived`, for a name no live instance has), or
+    /// with `instance`, only the checkpoints that instance took
+    /// ([`CheckpointRecord::instance`]) — `remove --purge`, which must not
+    /// reach the checkpoints of an earlier instance spawned under the same
+    /// name. Even then, never one another archived record names
+    /// (`removed_to`, `evicted`): that is where an earlier instance's work
+    /// was kept.
     ///
     /// This is the only operation that can break an undo, so nothing calls it
     /// implicitly: a checkpoint is what `newgit undo` restores, and the lane
@@ -7747,28 +9377,81 @@ impl BranchManager {
     /// record is archived the undo is unreachable anyway — but "unreachable"
     /// is still the user's call to make, not a garbage collector's.
     ///
-    /// Returns `None` when the instance has no checkpoints at all.
-    fn purge_checkpoints(&self, slug: &str, dry_run: bool) -> Result<Option<PurgedCheckpoints>> {
+    /// Returns `None` when there are no checkpoints to purge.
+    fn purge_checkpoints(
+        &self,
+        slug: &str,
+        instance: Option<&str>,
+        dry_run: bool,
+    ) -> Result<Option<PurgedCheckpoints>> {
         let dir = self.store.checkpoint_dir(slug);
         if !dir.is_dir() {
             return Ok(None);
         }
-        let checkpoints = CheckpointLog::new(dir.clone(), slug).list()?.len();
-        let refs = self
-            .source
-            .refs_under(&format!("refs/newgit/checkpoints/{slug}"))?;
-
-        if !dry_run {
-            for name in &refs {
-                self.source.delete_ref(name)?;
+        let log = CheckpointLog::new(dir.clone(), slug);
+        let Some(instance) = instance else {
+            let checkpoints = log.list()?.len();
+            let refs = self
+                .source
+                .refs_under(&format!("refs/newgit/checkpoints/{slug}"))?;
+            if !dry_run {
+                for name in &refs {
+                    self.source.delete_ref(name)?;
+                }
+                std::fs::remove_dir_all(&dir).map_err(|source| NewgitError::io(&dir, source))?;
             }
+            return Ok(Some(PurgedCheckpoints {
+                slug: slug.to_owned(),
+                checkpoints,
+                source_refs: refs.len(),
+                dir,
+            }));
+        };
+        // What other instances' archived records name. One that cannot be
+        // read could name anything, so nothing of this name is purged.
+        let mut named = BTreeSet::new();
+        for (archived_slug, record) in self.store.archived_branches()? {
+            match record {
+                Ok(record) if record.slug == slug && record.id != instance => {
+                    named.extend(record.removed_to);
+                    named.extend(record.evicted);
+                }
+                Ok(_) => {}
+                Err(_) if archived_slug == slug => return Ok(None),
+                Err(_) => {}
+            }
+        }
+        let records = log.list()?;
+        let ours: Vec<&CheckpointRecord> = records
+            .iter()
+            .filter(|record| record.instance.as_deref() == Some(instance))
+            .filter(|record| !named.contains(&record.id))
+            .collect();
+        if ours.is_empty() {
+            return Ok(None);
+        }
+        let mut source_refs = 0;
+        for record in &ours {
+            let held = self.source.ref_rev(&record.source.store_ref).is_some();
+            if held {
+                source_refs += 1;
+            }
+            if !dry_run {
+                if held {
+                    self.source.delete_ref(&record.source.store_ref)?;
+                }
+                log.delete(&record.id)?;
+            }
+        }
+        if !dry_run && ours.len() == records.len() {
+            // Nothing of the name's history left: the log goes too, as the
+            // whole-name purge does.
             std::fs::remove_dir_all(&dir).map_err(|source| NewgitError::io(&dir, source))?;
         }
-
         Ok(Some(PurgedCheckpoints {
             slug: slug.to_owned(),
-            checkpoints,
-            source_refs: refs.len(),
+            checkpoints: ours.len(),
+            source_refs,
             dir,
         }))
     }
@@ -7785,10 +9468,15 @@ impl BranchManager {
     /// A binding a tracker drop parked counts too, unless the drop already
     /// ran its `[cleanup]` (#254): it was this instance's, and nothing else
     /// will ever tear it down.
+    ///
+    /// The resources in `uncaptured` (a capture that failed) are not torn
+    /// down: their hook is rendered, not run, and named
+    /// [`HookDetail::SkippedUncaptured`].
     fn run_cleanup_hooks(
         &self,
         branch: &BranchInstance,
         dry_run: bool,
+        uncaptured: &BTreeMap<String, String>,
     ) -> Result<Vec<HookOutcome>> {
         let mut outcomes = Vec::new();
         for name in self.graph.lifecycle_order.iter().rev() {
@@ -7798,7 +9486,13 @@ impl BranchManager {
                 _ => continue,
             };
             let definition = self.resource_definition(name)?;
-            outcomes.push(self.run_cleanup_hook(branch, definition, binding, dry_run)?);
+            let skip = uncaptured.contains_key(name);
+            let mut outcome =
+                self.run_cleanup_hook(branch, definition, binding, dry_run || skip)?;
+            if skip && let HookDetail::WouldRun(command) = outcome.detail {
+                outcome.detail = HookDetail::SkippedUncaptured(command);
+            }
+            outcomes.push(outcome);
         }
         Ok(outcomes)
     }
@@ -7902,10 +9596,14 @@ impl BranchManager {
         }
 
         // The workspace is usually still here; when cleanup is finishing
-        // an instance whose workspace is already gone, the hook runs
-        // from the store root so an external teardown can still reach
-        // its own API. `workdir` is workspace-relative, so it has
-        // nothing to resolve against once the workspace itself is gone.
+        // an instance whose workspace is already gone, the hook still
+        // runs, so an external teardown can reach its own API, but from
+        // an empty directory of its own. Never the project root: a hook
+        // written for the workspace (`rm -rf postgres-data`) would then
+        // delete the project's own files of that name. `workdir` is
+        // workspace-relative, so it has nothing to resolve against once
+        // the workspace itself is gone.
+        let nowhere;
         let cwd = if branch.workspace_path.is_dir() {
             resource_cwd(
                 &branch.workspace_path,
@@ -7914,7 +9612,16 @@ impl BranchManager {
                 definition.workdir_for(None),
             )?
         } else {
-            self.store.paths().project_root.clone()
+            nowhere = tempfile::tempdir().map_err(|source| NewgitError::Io {
+                path: std::env::temp_dir().to_string_lossy().into_owned().into(),
+                source,
+            })?;
+            Utf8PathBuf::from_path_buf(nowhere.path().to_path_buf()).map_err(|path| {
+                NewgitError::Unsupported(format!(
+                    "the temporary directory {} is not UTF-8",
+                    path.display()
+                ))
+            })?
         };
 
         let log = self
@@ -7978,7 +9685,7 @@ impl BranchManager {
         // that helps. Its binding record is archived, not deleted.
         let (live, stale): (Vec<_>, Vec<_>) = branches
             .iter()
-            .partition(|branch| branch.workspace_path.is_dir());
+            .partition(|branch| branch.workspace_path.is_dir() || branch.evicted.is_some());
 
         // Stale when listed, live again by the time this got its lock.
         let mut revived = Vec::new();
@@ -7988,7 +9695,7 @@ impl BranchManager {
             // waited has already torn it down and archived the record, and a
             // `spawn` may have brought the name back with a new workspace.
             let branch = match self.store.find_branch(&branch.slug) {
-                Ok(branch) if branch.workspace_path.is_dir() => {
+                Ok(branch) if branch.workspace_path.is_dir() || branch.evicted.is_some() => {
                     revived.push(branch);
                     continue;
                 }
@@ -7997,7 +9704,7 @@ impl BranchManager {
                 Err(error) => return Err(error),
             };
             let branch = &branch;
-            let hooks = self.run_cleanup_hooks(branch, dry_run)?;
+            let hooks = self.run_cleanup_hooks(branch, dry_run, &BTreeMap::new())?;
             let archived_record = if dry_run {
                 None
             } else {
@@ -8033,6 +9740,9 @@ impl BranchManager {
         };
         let (orphans, unrecognized) = orphan_workspaces(&workspace_root, &claimed, &in_use)?;
         outcome.warnings.extend(unrecognized);
+        outcome
+            .warnings
+            .extend(self.saved_copy_warnings(&workspace_root, &branches));
         for orphan in orphans {
             if !dry_run {
                 std::fs::remove_dir_all(&orphan)
@@ -8082,15 +9792,28 @@ impl BranchManager {
                 if live_slugs.contains(slug.as_str()) {
                     continue;
                 }
-                if let Some(purged) = self.purge_checkpoints(&slug, dry_run)? {
+                if let Some(purged) = self.purge_checkpoints(&slug, None, dry_run)? {
                     outcome.purged_checkpoints.push(purged);
                 }
             }
         }
 
+        // Retention (#446): evict checkpoints a later eviction superseded,
+        // and what a restore that succeeded took on its way. Collected
+        // before the lane roots are read, so the revs only they held go too.
+        let (superseded, orphans) = self.superseded_checkpoints(&surviving, archived)?;
+        let (collected, collected_bytes) =
+            self.collect_checkpoints(&superseded, &orphans, dry_run)?;
+        let skipped: BTreeSet<(String, String)> = collected
+            .iter()
+            .map(|collected| (collected.slug.clone(), collected.id.clone()))
+            .collect();
+        outcome.collected_checkpoints = collected;
+        outcome.collected_bytes = collected_bytes;
+
         // Lane pruning. Roots come from the records that survive this pass,
         // so a dry run reports exactly what a real run would remove.
-        let roots = SnapshotRoots::collect(&self.store, &surviving, archived)?;
+        let roots = SnapshotRoots::collect_except(&self.store, &surviving, archived, &skipped)?;
         let lanes = self.store.paths().tracker_store.clone();
         for lane_rev in pinned_revs(&lanes)? {
             if roots.contains(&lane_rev.tracker, &lane_rev.rev) {
@@ -8188,6 +9911,15 @@ impl BranchManager {
                         .entry(definition.name.clone())
                         .or_default()
                         .push(format!("`{}` (--dry-run runs no key_command)", branch.name));
+                    continue;
+                }
+                // An evicted instance has no workspace to key from: the keys
+                // its trees had when it was evicted are what its restore
+                // refills.
+                if branch.evicted.is_some() {
+                    if let Some(key) = self.evicted_install_keys(branch).remove(&definition.name) {
+                        reachable.insert((definition.name.clone(), key));
+                    }
                     continue;
                 }
                 match self.install_key(branch, definition) {
@@ -8361,6 +10093,7 @@ impl BranchManager {
                     pushed: false,
                     project_root_error,
                     pulled: 0,
+                    restored: 0,
                 });
             }
             self.refuse_target_ahead(&target, &view.tip)?;
@@ -8411,21 +10144,41 @@ impl BranchManager {
         }
 
         let url = target.push_url();
+        // Every push to a target is cleared first, a dry run's too, which
+        // says what would be refused, and counts what `--force` puts back.
+        let put_back = if options.dry_run {
+            PutBack::Count
+        } else if options.republish {
+            PutBack::Republish
+        } else {
+            PutBack::Never
+        };
+        let how = if options.force {
+            PushExport::Force
+        } else {
+            PushExport::Onto
+        };
+        let cleared = self.clear_push(
+            &target,
+            &view.tip,
+            Pushing::Main {
+                from_push: options.from_push,
+            },
+            how,
+            put_back,
+        )?;
+        let restored = cleared.restored;
+        let theirs = cleared.theirs.clone();
         if !options.dry_run {
-            self.push_export(&target, &view.tip, &target.branch, options.force)
-                .map_err(|error| match error {
-                    NewgitError::SourceCommand { stderr, .. } if rejected(&stderr) => {
-                        NewgitError::Unsupported(format!(
-                            "`{}` holds commits the export does not descend from, so the push \
-                             was refused. That is expected the first time, when the target has \
-                             history of its own, or after the target's tracker set changed (a \
-                             different set composes a different history). `--force` replaces \
-                             the branch:\n{stderr}",
-                            target.branch
-                        ))
+            self.push_cleared(cleared).map_err(|error| match error {
+                NewgitError::SourceCommand { stderr, .. } if rejected(&stderr) => {
+                    match self.push_rejected(&target, theirs.as_deref(), &view.tip) {
+                        Ok(why) => NewgitError::Unsupported(format!("{why}:\n{stderr}")),
+                        Err(error) => error,
                     }
-                    other => other,
-                })?;
+                }
+                other => other,
+            })?;
             self.source.update_ref(&pushed_ref, &view.tip)?;
         }
 
@@ -8438,13 +10191,152 @@ impl BranchManager {
             pushed: !options.dry_run,
             project_root_error,
             pulled,
+            restored,
         })
     }
 
+    /// Refuse `tip`, about to be pushed to `target`, when `target`'s branch,
+    /// at `theirs` (none: gone), was rewritten since this machine last
+    /// exported to it and `tip` still holds what the rewrite removed. Asked
+    /// ahead of [`Self::clear_push`], which refuses it anyway, only where
+    /// another refusal would otherwise come first with worse advice.
+    fn refuse_rewritten_at(
+        &self,
+        target: &ExportTarget,
+        theirs: Option<&str>,
+        tip: &str,
+        refused: &str,
+    ) -> Result<()> {
+        let Some(pushed) = self.target_rewritten(target, theirs)? else {
+            return Ok(());
+        };
+        let held = self.removed_held(&pushed, theirs, tip)?;
+        if held == 0 {
+            return Ok(());
+        }
+        Err(self.rewritten_error(target, &pushed, theirs, Some(held), refused)?)
+    }
+
+    /// How to follow a rewrite of `target`, or why it cannot be followed.
+    fn follow_way(&self, target: &ExportTarget) -> String {
+        match &target.root {
+            Some(tracker) => format!(
+                "To follow it, `newgit pull --remote {name} --force --dry-run` says what \
+                 following drops and which instances still hold it, and without `--dry-run` \
+                 resets `{}`'s line to the target's; `newgit merge main` then publishes the \
+                 reset, and exporting again puts nothing it removed back",
+                crate::tracker::tracker_path(tracker),
+                name = target.name,
+            ),
+            None => format!(
+                "`{name}` is the project's own view (root declares it), and following a \
+                 rewrite of it means rewriting the project's history, which newgit cannot do \
+                 yet (`pull --remote --force` follows a target rooted at a tracker). Until it \
+                 can, this line cannot be exported to `{name}` without what the rewrite \
+                 removed: export the trackers to targets rooted at them instead, or point \
+                 `{name}` at a branch of its own; and a secret that was published there is \
+                 public, so rotate it whatever happens to the history",
+                name = target.name,
+            ),
+        }
+    }
+
+    /// Why a push of `tip` to `target`, at `theirs` (none: no such
+    /// branch), was rejected as not a fast-forward, with the way on. A
+    /// target rewritten since this machine's last export is refused before
+    /// the push; this is the rest: the target moved beside the export, or
+    /// this machine has no record of exporting there, so a rewrite cannot be
+    /// told from a target with history of its own.
+    fn push_rejected(
+        &self,
+        target: &ExportTarget,
+        theirs: Option<&str>,
+        tip: &str,
+    ) -> Result<String> {
+        let lacks = match theirs {
+            Some(theirs) => self.source.commit_count(&format!("{theirs}..{tip}"))?,
+            None => self.source.commit_count(tip)?,
+        };
+        let pushed = self
+            .source
+            .rev_parse(&export_ref(&target.name, "pushed"))
+            .ok();
+        let name = &target.name;
+        // Still on a line a reset here dropped (a second target, never
+        // purged): pulling it in is refused, and replacing it purges it.
+        if let (Some(tracker), Some(theirs)) = (&target.root, theirs)
+            && self.has_resets()
+            && let Err(dropped) = self.refuse_pulling_dropped(target, &[(tracker, theirs)])
+        {
+            return Ok(format!(
+                "`{branch}` on `{name}` is still on the line of `{}` a reset here dropped, and \
+                 `main` is not, so the push was refused. {dropped}. Or replace its branch with \
+                 this line, purging them there: `newgit export --remote {name} --force`",
+                crate::tracker::tracker_path(tracker),
+                branch = target.branch,
+            ));
+        }
+        let follow = match &target.root {
+            Some(_) => format!(
+                "`newgit pull --remote {name} --force --dry-run` says what following the \
+                 target's history would drop here"
+            ),
+            None => "following a rewrite of the project's own view is something newgit cannot \
+                     do yet"
+                .to_owned(),
+        };
+        if let (Some(pushed), Some(theirs)) = (pushed.as_deref(), theirs)
+            && (pushed == theirs || self.source.is_ancestor(pushed, theirs)?)
+        {
+            // This machine's record is the only one (#473): another
+            // machine's later export, then a rewrite of it, looks the same.
+            return Ok(format!(
+                "`{branch}` on `{name}` has commits of its own since this machine last exported \
+                 to it (merged there?), and `main` has {} it lacks, so the push was refused. \
+                 `newgit pull --remote {name}` merges them in, then export again; `--force` \
+                 would discard the target's. But if another machine exported to `{name}` after \
+                 this one, a rewrite of that export (a force-push, perhaps to purge a secret) \
+                 looks exactly like this here, and merging it in keeps what the rewrite removed \
+                 for the next export to put back. Check first: {check}",
+                plural_commits(lacks as usize),
+                branch = target.branch,
+                check = match &target.root {
+                    Some(_) => follow.clone(),
+                    None => format!(
+                        "look at what `{}` there holds before pulling it in",
+                        target.branch
+                    ),
+                },
+            ));
+        }
+        Ok(format!(
+            "`{branch}` on `{name}` holds commits the export does not descend from, so the push \
+             was refused. That is expected the first time, when the target has history of its \
+             own, or after the target's tracker set changed (a different set composes a \
+             different history). It is also what a rewrite there looks like (a force-push, \
+             perhaps to purge a secret), and this machine has no record of exporting to \
+             `{name}` to tell them apart. Check before replacing it: {follow}. `--force` \
+             replaces the branch, publishing the {} the export has that the target lacks, \
+             which puts back anything such a rewrite removed",
+            plural_commits(lacks as usize),
+            branch = target.branch,
+        ))
+    }
+
     /// Refuse when `target`'s branch has commits `tip` does not: a push does
-    /// not pull, so it names the command that does.
+    /// not pull, so it names the command that does. A branch rewritten
+    /// since this machine last exported there is refused first, even when
+    /// it is behind `tip` (a rewind), since pushing would put back what the
+    /// rewrite removed.
     fn refuse_target_ahead(&self, target: &ExportTarget, tip: &str) -> Result<()> {
-        let Some(theirs) = self.fetch_target(target)? else {
+        let theirs = self.fetch_target(target)?;
+        self.refuse_rewritten_at(
+            target,
+            theirs.as_deref(),
+            tip,
+            "This push would put them back",
+        )?;
+        let Some(theirs) = theirs else {
             return Ok(());
         };
         if theirs == tip || self.source.is_ancestor(&theirs, tip)? {
@@ -8494,10 +10386,23 @@ impl BranchManager {
                     target.branch, target.name
                 )));
             }
+            // Plain `newgit pull` in the project root took them in on its
+            // own branch; `main` takes them when that merges.
+            if self.local_branch_has(
+                tracker,
+                &format!("instances/{PROJECT_ROOT_INSTANCE}"),
+                &theirs,
+            )? {
+                return Err(NewgitError::Unsupported(format!(
+                    "`{}` on `{}` has {commits} commit(s) `{tracker}`'s `main` does not, but \
+                     the project root already has them (`newgit pull` took them in, not merged \
+                     yet): `newgit merge main`, then export again",
+                    target.branch, target.name
+                )));
+            }
             return Err(NewgitError::Unsupported(format!(
                 "`{}` on `{}` has {commits} commit(s) `{tracker}`'s `main` does not (merged \
-                 there?): `newgit pull --remote {}` brings them in, then export again. \
-                 `--force` replaces the branch instead",
+                 there?): `newgit pull --remote {}` brings them in, then export again",
                 target.branch, target.name, target.name
             )));
         }
@@ -8512,7 +10417,7 @@ impl BranchManager {
                  project root's `{branch}` cannot fast-forward to them: it has commits of its \
                  own, or the target withholds a tracker, so its commits are not the project's. \
                  `newgit pull --remote {}` brings them in as work in the project root, then \
-                 `newgit merge main` publishes them; or replace the branch with `--force`",
+                 `newgit merge main` publishes them",
                 target.branch, target.name, target.name
             )));
         }
@@ -8628,6 +10533,34 @@ impl BranchManager {
                 target.name, target.branch
             ))
         })?;
+        if let Some(pushed) = self.target_rewritten(&target, Some(&theirs))? {
+            // Followed already (a reset, or a pull since), nothing is refused.
+            let holds = match &target.root {
+                Some(tracker) => {
+                    let stands_for =
+                        crate::compose::read_root(&self.store.paths().project_root, &pushed)?
+                            .filter(|(root, _)| root == tracker)
+                            .map_or_else(|| pushed.clone(), |(_, commit)| commit);
+                    match self.rooted_ours(tracker)? {
+                        Some(ours) => {
+                            ours == stands_for || self.source.is_ancestor(&stands_for, &ours)?
+                        }
+                        None => false,
+                    }
+                }
+                None => true,
+            };
+            if holds {
+                return Err(self.rewritten_error(
+                    &target,
+                    &pushed,
+                    Some(&theirs),
+                    None,
+                    "Merging it in, as plain `pull --remote` does, would keep them here for \
+                     the next export to put back",
+                )?);
+            }
+        }
         match target.root.clone() {
             Some(tracker) => self.pull_rooted(&target, &tracker, &theirs),
             None => self.pull_view(&target, &theirs),
@@ -8681,6 +10614,8 @@ impl BranchManager {
                 audience: &audience,
                 newgit_made: None,
                 need_history: &|tracker| self.need_history(tracker),
+                forks_before: &self.fork_records(),
+                settled: &[],
             },
         )?)
     }
@@ -8691,6 +10626,81 @@ impl BranchManager {
         tracker: &str,
         theirs: &str,
     ) -> Result<PullRemoteOutcome> {
+        let definition = self
+            .carved
+            .iter()
+            .find(|definition| definition.name == tracker)
+            .cloned()
+            .ok_or_else(|| {
+                NewgitError::Unsupported(format!("`{tracker}` is not a tracker in Git here"))
+            })?;
+        let ours = self.rooted_ours(tracker)?;
+        let rooted = self.rooted_merge(target, tracker, theirs, ours.as_deref())?;
+        // A second target, never purged, still has what a reset dropped.
+        let mut lines = vec![(tracker, rooted.main.as_str())];
+        lines.extend(
+            rooted
+                .children
+                .iter()
+                .map(|(child, commit)| (child.as_str(), commit.as_str())),
+        );
+        self.refuse_pulling_dropped(target, &lines)?;
+        // `main` moves with the pin, after the project root has taken it.
+        let mut mains: Vec<(String, String)> = if ours.as_deref() != Some(rooted.main.as_str()) {
+            vec![(tracker.to_owned(), rooted.main.clone())]
+        } else {
+            Vec::new()
+        };
+        mains.extend(rooted.children.iter().cloned());
+        let (pinned, view) =
+            self.move_pin(None, &definition, &rooted.main, &rooted.from, &mains)?;
+        Ok(PullRemoteOutcome {
+            target: target.name.clone(),
+            url: target.push_url(),
+            branch: target.branch.clone(),
+            root: Some(tracker.to_owned()),
+            commits: rooted.commits,
+            merged: rooted.merged,
+            pinned,
+            view,
+        })
+    }
+
+    /// Tracker `tracker`'s `main` as published, or as it is here when that
+    /// is ahead of it (pulled back before, not merged yet): what a pull from
+    /// its rooted target starts from, so a pull again finds nothing.
+    fn rooted_ours(&self, tracker: &str) -> Result<Option<String>> {
+        let published = self.tracker_branch_commit(tracker, "main")?;
+        let here = self
+            .source
+            .rev_parse(&local_tracker_ref(tracker, "main"))
+            .ok();
+        Ok(match (&published, &here) {
+            (Some(published), Some(here))
+                if published != here
+                    && (self.source.is_ancestor(published, here)?
+                        || self.reset_replaces(tracker, published, here)?) =>
+            {
+                Some(here.clone())
+            }
+            (None, Some(here)) => Some(here.clone()),
+            _ => published,
+        })
+    }
+
+    /// What export target `target`, rooted at `tracker`, at `theirs`, makes
+    /// of `ours` (the tracker's commit it is pulled into): `ours` fast-
+    /// forwarded to the target's commits, or really merged with them as
+    /// `newgit merge` would. Moves nothing: the caller decides where the
+    /// result lands. Fails, moving nothing, on a real conflict and on a
+    /// history adding a file a tracker outside Git owns.
+    fn rooted_merge(
+        &self,
+        target: &ExportTarget,
+        tracker: &str,
+        theirs: &str,
+        ours: Option<&str>,
+    ) -> Result<RootedPull> {
         let project = self.store.paths().project_root.clone();
         let definition = self
             .carved
@@ -8700,22 +10710,6 @@ impl BranchManager {
             .ok_or_else(|| {
                 NewgitError::Unsupported(format!("`{tracker}` is not a tracker in Git here"))
             })?;
-        // `main` as published, or as it is here when that is ahead of it
-        // (pulled back before, not merged yet): a pull again finds nothing.
-        let published = self.tracker_branch_commit(tracker, "main")?;
-        let here = self
-            .source
-            .rev_parse(&local_tracker_ref(tracker, "main"))
-            .ok();
-        let ours = match (&published, &here) {
-            (Some(published), Some(here))
-                if published != here && self.source.is_ancestor(published, here)? =>
-            {
-                Some(here.clone())
-            }
-            (None, Some(here)) => Some(here.clone()),
-            _ => published,
-        };
         // A root that mounts trackers in Git is exported as a view, so what
         // comes back is view commits: split, each file goes to the tracker
         // that owns it. Adopted as they are, a change under a child's mount
@@ -8725,13 +10719,13 @@ impl BranchManager {
             .iter()
             .filter(|child| child.parent.as_deref() == Some(tracker))
             .collect();
-        let exported = match (&ours, children.is_empty()) {
+        let exported = match (ours, children.is_empty()) {
             (Some(ours), false) => Some(self.compose_rooted(target, tracker, ours)?),
             _ => None,
         };
         let mut new_args = vec![theirs];
-        if let Some(seen) = exported.as_ref().or(ours.as_ref()) {
-            new_args.extend(["--not", seen.as_str()]);
+        if let Some(seen) = exported.as_deref().or(ours) {
+            new_args.extend(["--not", seen]);
         }
         let all = self.all_definitions();
         if let Some((commit, path, owner)) = crate::compose::find_outside_git_under(
@@ -8741,13 +10735,7 @@ impl BranchManager {
             &all,
             Some(&definition.mount),
         )? {
-            return Err(NewgitError::SplitRefused(format!(
-                "commit {} on `{}` adds `{path}`, which belongs to `{owner}`, a tracker outside \
-                 Git: its files (secrets among them) never come in or leave through Git, so \
-                 nothing was pulled. It has to come out of that history first",
-                short(&commit),
-                target.name
-            )));
+            return Err(outside_git_on_target(&commit, &target.name, &path, &owner));
         }
         let mut count_args = vec!["-C", project.as_str(), "rev-list", "--count"];
         count_args.extend(&new_args);
@@ -8771,13 +10759,13 @@ impl BranchManager {
             Some(outcome.root)
         };
         let theirs = split_tip.as_deref().unwrap_or(theirs);
-        let (main, merged) = match &ours {
+        let (main, merged) = match ours {
             None => (theirs.to_owned(), false),
             Some(ours) if ours == theirs || self.source.is_ancestor(theirs, ours)? => {
-                (ours.clone(), false)
+                (ours.to_owned(), false)
             }
             Some(ours) if self.source.is_ancestor(ours, theirs)? => (theirs.to_owned(), false),
-            Some(ours) => match self.merge_commits(ours, theirs, &format!("Merge {from}"))? {
+            Some(ours) => match self.merge_pulled(ours, theirs, &format!("Merge {from}"))? {
                 Ok(merged) => (merged, true),
                 Err(files) => {
                     return Err(NewgitError::Unsupported(format!(
@@ -8791,23 +10779,13 @@ impl BranchManager {
                 }
             },
         };
-        // `main` moves with the pin, after the project root has taken it.
-        let mut mains: Vec<(String, String)> = if ours.as_deref() != Some(main.as_str()) {
-            vec![(tracker.to_owned(), main.clone())]
-        } else {
-            Vec::new()
-        };
-        mains.extend(moved_children);
-        let pulled = self.move_pin(None, &definition, &main, &from, &mains)?;
-        Ok(PullRemoteOutcome {
-            target: target.name.clone(),
-            url: target.push_url(),
-            branch: target.branch.clone(),
-            root: Some(tracker.to_owned()),
-            commits,
+        Ok(RootedPull {
+            tip: theirs.to_owned(),
+            main,
             merged,
-            pinned: pulled.commits,
-            view: pulled.view,
+            commits,
+            children: moved_children,
+            from,
         })
     }
 
@@ -8875,13 +10853,7 @@ impl BranchManager {
         if let Some((commit, path, owner)) =
             crate::compose::find_outside_git(&project, &[&tip, "--not", &head], &[], &all)?
         {
-            return Err(NewgitError::SplitRefused(format!(
-                "commit {} on `{}` adds `{path}`, which belongs to `{owner}`, a tracker outside \
-                 Git: its files (secrets among them) never come in or leave through Git, so \
-                 nothing was pulled. It has to come out of that history first",
-                short(&commit),
-                target.name
-            )));
+            return Err(outside_git_on_target(&commit, &target.name, &path, &owner));
         }
         let commits: usize = crate::source::run_git_env(
             &[
@@ -8921,6 +10893,18 @@ impl BranchManager {
                 }
             }
         };
+        // The target's view may pin a line a reset dropped (a second
+        // target, never purged): judged by every pin the pull moves.
+        if self.has_resets() {
+            let before = crate::compose::index(&project, &self.root.name, &head)?;
+            let after = crate::compose::index(&project, &self.root.name, &new_head)?;
+            let moved: Vec<(&str, &str)> = after
+                .iter()
+                .filter(|(tracker, commit)| before.get(*tracker) != Some(*commit))
+                .map(|(tracker, commit)| (tracker.as_str(), commit.as_str()))
+                .collect();
+            self.refuse_pulling_dropped(target, &moved)?;
+        }
         let checked_out = crate::source::run_git_env(
             &["-C", project.as_str(), "symbolic-ref", "-q", "HEAD"],
             &[],
@@ -8953,7 +10937,12 @@ impl BranchManager {
 
     /// Whether tracker `tracker`'s `main` here already holds `commit`.
     fn local_main_has(&self, tracker: &str, commit: &str) -> Result<bool> {
-        match self.source.rev_parse(&local_tracker_ref(tracker, "main")) {
+        self.local_branch_has(tracker, "main", commit)
+    }
+
+    /// Whether tracker `tracker`'s branch `branch` here has `commit`.
+    fn local_branch_has(&self, tracker: &str, branch: &str, commit: &str) -> Result<bool> {
+        match self.source.rev_parse(&local_tracker_ref(tracker, branch)) {
             Ok(here) => Ok(here == commit || self.source.is_ancestor(commit, &here)?),
             Err(_) => Ok(false),
         }
@@ -8974,7 +10963,77 @@ impl BranchManager {
                     .to_owned(),
             });
         }
-        crate::export_target::resolve_targets(&self.all_definitions())
+        let targets = crate::export_target::resolve_targets(&self.all_definitions())?;
+        if let Some((target, origin)) = self.target_at_origin(&targets)? {
+            return Err(self.target_at_origin_error(target, &origin));
+        }
+        Ok(targets)
+    }
+
+    /// Why export target `target` may not be the store's `origin` (at
+    /// `origin`), and what to do instead.
+    fn target_at_origin_error(&self, target: &ExportTarget, origin: &str) -> NewgitError {
+        NewgitError::InvalidDefinition {
+            kind: "tracker",
+            name: crate::tracker::tracker_path(target.declared_by()),
+            reason: format!(
+                "`export` pushes to {}, which is the project's own `{PUBLISH_REMOTE}` \
+                 ({origin}). A push from a workspace goes to `{PUBLISH_REMOTE}` as it is, \
+                 uncomposed and unchecked, so the target would get commits an export never \
+                 sends there (a tracker withheld from it, a commit purged from it by a \
+                 force-push); nothing was pushed. Export to a repository of its own, or point \
+                 `{PUBLISH_REMOTE}` elsewhere (`git -C {} remote set-url {PUBLISH_REMOTE} \
+                 <url>`)",
+                target.url,
+                self.store.paths().project_root,
+            ),
+        }
+    }
+
+    /// The first of `targets` that is the same repository as the store's
+    /// `origin` (fetched from or pushed to), with that `origin` URL. Each
+    /// is compared as written and as Git would use it (`insteadOf`
+    /// applied), so a rewrite of one to the other is seen too.
+    fn target_at_origin<'a>(
+        &self,
+        targets: &'a [ExportTarget],
+    ) -> Result<Option<(&'a ExportTarget, String)>> {
+        let root = self.store.paths().project_root.clone();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-C", root.as_str()];
+            full.extend_from_slice(args);
+            crate::source::run_git_env(&full, &[])
+                .ok()
+                .map(|out| out.trim().to_owned())
+                .filter(|out| !out.is_empty())
+        };
+        let mut origins: Vec<String> = git(&["config", "--get", "remote.origin.url"])
+            .into_iter()
+            .collect();
+        for push in [false, true] {
+            origins.extend(self.source.remote_url(PUBLISH_REMOTE, push)?);
+        }
+        if origins.is_empty() {
+            return Ok(None);
+        }
+        Ok(targets.iter().find_map(|target| {
+            let url = target.push_url();
+            let spellings: Vec<String> = [
+                Some(target.url.clone()),
+                git(&["ls-remote", "--get-url", "--", &url]),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            origins
+                .iter()
+                .find(|origin| {
+                    spellings
+                        .iter()
+                        .any(|spelling| crate::export_target::same_repository(spelling, origin))
+                })
+                .map(|origin| (target, origin.clone()))
+        }))
     }
 
     /// `"inherit"` follows the parent wherever it ships, whoever reads it
@@ -9044,9 +11103,9 @@ impl BranchManager {
     }
 
     /// Compose `list` (tracker → commit) as `target` sees it — its trackers
-    /// only — at `refs/newgit/exports/<target>/<branch>`, and refuse a
-    /// history that ever adds a path a tracker outside Git owns: a path made
-    /// secret later stays in the commits that once held it.
+    /// only — at `refs/newgit/exports/<target>/<branch>`. Nothing is pushed:
+    /// [`Self::refuse_new_outside_git`] judges what a push would send, a
+    /// file a tracker outside Git owns and a commit a reset dropped alike.
     fn compose_export(
         &self,
         target: &ExportTarget,
@@ -9085,7 +11144,6 @@ impl BranchManager {
 
         self.bring_pins(&root_name, root_commit, &BTreeMap::new())?;
         let root = self.store.paths().project_root.clone();
-        let all = self.all_definitions();
         let may_ship = |tracker: &str| shipped.contains(tracker);
         let view = crate::compose::compose(
             &root,
@@ -9108,24 +11166,6 @@ impl BranchManager {
                 target.name
             ))
         })?;
-        // A rooted view holds the tracker's files at its own root: each is
-        // judged where the project's view has it, under the mount.
-        let mount = target
-            .root
-            .as_ref()
-            .and_then(|_| code.iter().find(|definition| definition.name == root_name))
-            .map(|definition| definition.mount.clone());
-        if let Some((commit, path, tracker)) =
-            crate::compose::find_outside_git_under(&root, &[&tip], &[], &all, mount.as_deref())?
-        {
-            return Err(NewgitError::SplitRefused(format!(
-                "the export to `{}` would carry commit {}, which adds `{path}`, and `{path}` \
-                 belongs to `{tracker}`, a tracker outside Git, whose files (secrets among them) \
-                 never leave this machine through Git, so this history cannot be exported as it is",
-                target.name,
-                &commit[..commit.len().min(12)]
-            )));
-        }
         Ok((
             trackers,
             ComposedExport {
@@ -9135,30 +11175,96 @@ impl BranchManager {
         ))
     }
 
-    /// Push `tip` to `branch` on `target`, with plain `git push` and the
-    /// user's own credentials. `--no-verify`: the project's own pre-push
-    /// hooks are for its work, not for a mirror of it.
-    fn push_export(
+    /// An instance's branch pushed to `target`, cleared first as every push
+    /// to a target is ([`Self::clear_push`]), and whether it replaced what
+    /// was there. A lease fails when the target no longer has
+    /// the branch at all (a pull request closed with its branch deleted): it
+    /// is then pushed as new, which fails in turn if someone made it again
+    /// meanwhile. A push the target refused is [`branch_refused`], which
+    /// `recorded` (newgit has a record of its last push there) words.
+    fn push_branch_export(
         &self,
         target: &ExportTarget,
         tip: &str,
-        branch: &str,
-        force: bool,
-    ) -> Result<()> {
-        let refspec = format!("{}{tip}:refs/heads/{branch}", if force { "+" } else { "" });
-        crate::source::run_git_env(
+        branch: &BranchInstance,
+        how: PushExport<'_>,
+        recorded: bool,
+    ) -> Result<bool> {
+        let name = branch.source_ref.as_str();
+        let refused = |unchecked: Option<String>| {
+            branch_refused(branch, &target.name, recorded, unchecked.as_deref())
+        };
+        let push = |how: PushExport<'_>| {
+            let cleared =
+                self.clear_push(target, tip, Pushing::Branch(branch), how, PutBack::Never)?;
+            self.push_cleared(cleared)
+        };
+        match push(how) {
+            Ok(()) => return Ok(matches!(how, PushExport::Replacing(_))),
+            Err(error) if !is_rejected(&error) => return Err(error),
+            Err(_) if !matches!(how, PushExport::Replacing(_)) => return Err(refused(None)),
+            Err(_) => {}
+        }
+        let head = format!("refs/heads/{name}");
+        let listed = match crate::source::run_git_env(
             &[
                 "-C",
                 self.store.paths().project_root.as_str(),
-                "push",
-                "--quiet",
-                "--no-verify",
+                "ls-remote",
+                "--",
                 &target.push_url(),
-                &refspec,
+                &head,
             ],
             &[],
-        )
-        .map(|_| ())
+        ) {
+            Ok(listed) => listed,
+            Err(error) => return Err(refused(Some(error.to_string()))),
+        };
+        if listed
+            .lines()
+            .any(|line| line.split_once('\t').is_some_and(|(_, name)| name == head))
+        {
+            return Err(refused(None));
+        }
+        match push(PushExport::Onto) {
+            Ok(()) => Ok(false),
+            Err(error) if is_rejected(&error) => Err(refused(None)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Refuse to replace `recorded`, what newgit last put on `target` for
+    /// `branch`, when composing its root commit for `target` now gives
+    /// another commit: the target's tracker set changed, so every commit of
+    /// the branch there would change with it, and `main`'s export needs
+    /// `--force` for that. Refused too when that cannot be told.
+    fn refuse_recomposed(
+        &self,
+        target: &ExportTarget,
+        branch: &BranchInstance,
+        recorded: &str,
+    ) -> Result<()> {
+        let project = self.store.paths().project_root.clone();
+        // One per instance: two instances may heal on one target at once.
+        let scratch = format!("replacing/{}", branch.slug);
+        let again = crate::compose::read_root(&project, recorded)?
+            .filter(|(tracker, _)| tracker == target.declared_by())
+            .map(|(tracker, root)| {
+                let composed =
+                    self.compose_export(target, &BTreeMap::from([(tracker, root)]), &scratch);
+                let _ = self.source.delete_ref(&export_ref(&target.name, &scratch));
+                composed
+            })
+            .transpose()?;
+        if again.is_some_and(|(_, view)| view.tip == recorded) {
+            return Ok(());
+        }
+        Err(NewgitError::Unsupported(format!(
+            "`{}` on `{}` no longer descends from what newgit last put there, and its \
+             trackers are not the ones that composed that, so every commit there would change. \
+             It was left as it is: `newgit export {} --remote {} --force` replaces it",
+            branch.source_ref, target.name, branch.name, target.name
+        )))
     }
 
     /// After a push from instance `branch` reached its remote: its branch,
@@ -9167,11 +11273,24 @@ impl BranchManager {
     /// the commit the target now really holds, so `gh` can tell whether the
     /// agent's `HEAD` is on it. A failure is reported per target; the push
     /// itself already succeeded.
+    ///
+    /// When what goes there now does not descend from what newgit last put
+    /// there (`refs/newgit/exports/<target>/pushed-branches/<slug>`, written
+    /// only once a push succeeded) — the instance's commits were split again,
+    /// onto the root commits the remote made (*One commit, one root commit*) —
+    /// the branch is replaced, with that record as the lease: only while the
+    /// target still holds exactly it, so a commit anyone else pushed there is
+    /// never thrown away. Not when the target's tracker set changed since,
+    /// which `--force` is for, as it is for `main`. A branch the target no
+    /// longer has is pushed again. A force-push from the workspace replaces
+    /// it over the record too, whatever composes there, and never without
+    /// one: only [`BranchOver::Force`] replaces it whatever it holds.
     fn export_instance(
         &self,
         branch: &BranchInstance,
         head: &str,
-        forced: bool,
+        over: BranchOver,
+        split: Option<BTreeMap<String, String>>,
     ) -> Vec<BranchExport> {
         let targets = match self.export_targets() {
             Ok(targets) => targets,
@@ -9187,11 +11306,14 @@ impl BranchManager {
             }
         };
         let routing = self.route_branch(branch, &targets);
-        let mut list = BTreeMap::new();
+        // What `head` was split into when the caller says, the instance's
+        // tracker branches otherwise.
+        let from_branches = split.is_none();
+        let mut list = split.unwrap_or_default();
         for definition in self
             .carved_definitions()
             .into_iter()
-            .filter(|_| !routing.exporting.is_empty())
+            .filter(|_| from_branches && !routing.exporting.is_empty())
         {
             let commit = [format!("instances/{}", branch.slug), "main".to_owned()]
                 .iter()
@@ -9209,9 +11331,40 @@ impl BranchManager {
             .iter()
             .map(|target| {
                 let result = (|| {
+                    // What newgit last put there, by its own record. Never
+                    // what a fetch of the target says it holds: that is
+                    // anyone's, and a lease on it protects nothing.
+                    let pushed_ref = pushed_branch_ref(&target.name, &branch.slug);
+                    let recorded = self.source.rev_parse(&pushed_ref).ok();
                     let (trackers, view) =
                         self.compose_export(target, &list, &format!("instances/{}", branch.slug))?;
-                    self.push_export(target, &view.tip, &branch.source_ref, forced)?;
+                    let behind = match &recorded {
+                        Some(recorded) => {
+                            *recorded != view.tip
+                                && !self.source.is_ancestor(recorded, &view.tip)?
+                        }
+                        None => false,
+                    };
+                    let how = match (over, recorded.as_deref()) {
+                        (BranchOver::Force, _) => PushExport::Force,
+                        (_, Some(recorded)) if behind => {
+                            // A force-push here rewrote the branch on purpose,
+                            // so a changed tracker set changes it too.
+                            if over == BranchOver::Push {
+                                self.refuse_recomposed(target, branch, recorded)?;
+                            }
+                            PushExport::Replacing(recorded)
+                        }
+                        _ => PushExport::Onto,
+                    };
+                    let replaced = self.push_branch_export(
+                        target,
+                        &view.tip,
+                        branch,
+                        how,
+                        recorded.is_some(),
+                    )?;
+                    self.source.update_ref(&pushed_ref, &view.tip)?;
                     crate::source::run_git_env(
                         &[
                             "-C",
@@ -9230,6 +11383,7 @@ impl BranchManager {
                         &[],
                     )?;
                     Ok::<_, NewgitError>(BranchExported {
+                        replaced,
                         same_commits: view.tip == head,
                         withheld: trackers
                             .into_iter()
@@ -9244,14 +11398,7 @@ impl BranchManager {
                     repo: target.url.clone(),
                     gh_resolved: routing.resolved == Some(target.name.as_str()),
                     branch: branch.source_ref.clone(),
-                    result: result.map_err(|error| match error {
-                        NewgitError::SourceCommand { stderr, .. } if rejected(&stderr) => format!(
-                            "`{}` there has commits this branch does not descend from (someone \
-                             pushed to it directly?), so it was left as it is",
-                            branch.source_ref
-                        ),
-                        other => other.to_string(),
-                    }),
+                    result: result.map_err(|error| error.to_string()),
                 }
             })
             .collect();
@@ -9261,6 +11408,84 @@ impl BranchManager {
             let _ = self.point_gh(branch, &targets, routing.resolved);
         }
         exports
+    }
+
+    /// Export instance `instance`'s branch to target `name` again, as its
+    /// `git push` does once the push has reached the remote: the branch as
+    /// last pushed, not whatever the workspace has since, because a mirror
+    /// holds what `git push` sent. For an export that failed, and for a branch
+    /// whose commits there were built on a copy of what the target's `main`
+    /// already has (*One commit, one root commit*), whose tracker branches
+    /// here heal with it. Nothing in the workspace moves but its record of
+    /// what the target holds. `force` replaces whatever the target's branch
+    /// holds, as `main`'s `--force` does.
+    pub fn export_branch_to_remote(
+        &self,
+        instance: &str,
+        name: &str,
+        force: bool,
+    ) -> Result<BranchExport> {
+        self.refuse_unlinked()?;
+        self.require_resolvable_graph()?;
+        let (_lock, branch) = self.locked_branch(instance)?;
+        let target = self.export_target(name)?;
+        if !target.branches {
+            return Err(NewgitError::Unsupported(format!(
+                "`{name}` takes no branches, only `main` (`newgit export --remote {name}`): \
+                 `branches = true` in the `export` that declares it sends each instance's \
+                 branch there too"
+            )));
+        }
+        let outbox = self.outbox();
+        let pushed = crate::source::run_git_env(
+            &[
+                "-C",
+                outbox.as_str(),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}^{{commit}}", branch.source_ref),
+            ],
+            &[],
+        )
+        .map(|pushed| pushed.trim().to_owned())
+        .map_err(|_| {
+            NewgitError::Unsupported(format!(
+                "`{}` has not been pushed yet, so there is nothing of it to export: `git push \
+                 origin {}` in its workspace pushes and exports it",
+                branch.name, branch.source_ref
+            ))
+        })?;
+        self.prepare_projection()?;
+        // The instance's own tracker branches first, split again where they
+        // stand (its last checkpoint, which may be ahead of the push), so they
+        // heal as the branch there does, and a merge of it brings no copy.
+        let root_ref = local_tracker_ref(&self.root.name, &format!("instances/{}", branch.slug));
+        let standing = self.source.rev_parse(&root_ref).ok().and_then(|root| {
+            let mut objects =
+                crate::objects::Objects::open(&self.store.paths().project_root).ok()?;
+            crate::compose::parse_split(&objects.commit(&root).ok()?.message)
+                .map(|split| split.source)
+        });
+        if let Some(standing) = standing {
+            self.split_instance(&branch.slug, &standing)?;
+        }
+        self.learn_before_split(&branch, &pushed);
+        let split = self.split_view(&pushed, &branch.dropped)?.index;
+        let over = if force {
+            BranchOver::Force
+        } else {
+            BranchOver::Push
+        };
+        self.export_instance(&branch, &pushed, over, Some(split))
+            .into_iter()
+            .find(|export| export.target == name)
+            .ok_or_else(|| {
+                NewgitError::Unsupported(format!(
+                    "`{}` holds nothing `{name}` ships, so it is not exported there",
+                    branch.source_ref
+                ))
+            })
     }
 
     /// Record one coherent snapshot across source, trackers, and resources.
@@ -9499,7 +11724,7 @@ impl BranchManager {
         // with nothing landed.
         let targets = self.export_targets()?;
         if updates.is_empty() {
-            let tags = self.push_tags(&targets, tags)?;
+            let tags = self.push_tags(&targets, tags, &BTreeSet::new())?;
             return Ok(ProjectPushOutcome {
                 merge: None,
                 exports: Vec::new(),
@@ -9507,7 +11732,7 @@ impl BranchManager {
             });
         }
         let merge = self.merge(PROJECT_ROOT_INSTANCE, PROJECT_ROOT_INSTANCE)?;
-        let exports = targets
+        let exports: Vec<ProjectPushExport> = targets
             .iter()
             .map(|target| ProjectPushExport {
                 target: target.name.clone(),
@@ -9525,7 +11750,12 @@ impl BranchManager {
             .collect();
         // After the merge: a tag names a commit on `main`, which the merge
         // may just have put there.
-        let tags = self.push_tags(&targets, tags)?;
+        let refused: BTreeSet<String> = exports
+            .iter()
+            .filter(|export| export.result.is_err())
+            .map(|export| export.target.clone())
+            .collect();
+        let tags = self.push_tags(&targets, tags, &refused)?;
         Ok(ProjectPushOutcome {
             merge: Some(merge),
             exports,
@@ -9593,10 +11823,15 @@ impl BranchManager {
     /// `v0.1.x`), and a tag never moves, so the project's `v0.9.0` there
     /// would take that name from it for good. Tags from such a target are
     /// refused coming in for the same reason.
+    ///
+    /// `refused`: targets this same push's export of `main` failed on. A tag
+    /// is not pushed to one: it names a commit of `main`, which that target
+    /// was just refused (a rewrite there removed what it holds, perhaps).
     fn push_tags(
         &self,
         targets: &[ExportTarget],
         tags: Vec<(String, PushedTag)>,
+        refused: &BTreeSet<String>,
     ) -> Result<Vec<ProjectPushTag>> {
         if tags.is_empty() {
             return Ok(Vec::new());
@@ -9620,11 +11855,17 @@ impl BranchManager {
                 Some(list) => targets
                     .iter()
                     .map(|target| {
-                        (
-                            target.name.clone(),
+                        let result = if refused.contains(&target.name) {
+                            Err(format!(
+                                "the export of `{}` to `{}` failed in this push, so the tag \
+                                 naming it was not pushed there either",
+                                target.branch, target.name
+                            ))
+                        } else {
                             self.export_tag(target, &name, list, tag.annotation.as_ref())
-                                .map_err(|error| error.to_string()),
-                        )
+                                .map_err(|error| error.to_string())
+                        };
+                        (target.name.clone(), result)
                     })
                     .collect(),
                 None => Vec::new(),
@@ -9693,18 +11934,17 @@ impl BranchManager {
             )?,
             None => view.tip.clone(),
         };
-        crate::source::run_git_env(
-            &[
-                "-C",
-                project.as_str(),
-                "push",
-                "--quiet",
-                "--no-verify",
-                &target.push_url(),
-                &format!("{object}:{tag_ref}"),
-            ],
-            &[],
+        let cleared = self.clear_push(
+            target,
+            &view.tip,
+            Pushing::Tag {
+                name,
+                object: &object,
+            },
+            PushExport::Onto,
+            PutBack::Never,
         )?;
+        self.push_cleared(cleared)?;
         Ok(true)
     }
 
@@ -9787,6 +12027,18 @@ impl BranchManager {
             rev_list.extend(history.as_deref());
             self.refuse_outside_git(&outbox, &rev_list, &quarantine)?;
         }
+        if !on_remote {
+            // The forward to `origin` is a raw push, with nothing an export
+            // checks: so never to a target's own repository (refused when
+            // the targets are read; this is the backstop, so it reads them
+            // without that check), and nothing a reset dropped that
+            // `origin` lacks.
+            let targets = crate::export_target::resolve_targets(&self.all_definitions())?;
+            if let Some((target, origin)) = self.target_at_origin(&targets)? {
+                return Err(self.target_at_origin_error(target, &origin));
+            }
+            self.refuse_forwarding_dropped(&outbox, &rev_list, &quarantine)?;
+        }
 
         let mut checkpoint = self.checkpoint_branch(
             &mut branch,
@@ -9814,7 +12066,7 @@ impl BranchManager {
                 )));
             }
         } else {
-            GitSource::forward_push(&self.outbox(), &url, None, updates, admitting)?;
+            GitSource::forward_push(&outbox, &url, None, updates, admitting)?;
         }
 
         // The instance's own branch goes on to each target that takes
@@ -9831,7 +12083,12 @@ impl BranchManager {
             Some((old, new)) => {
                 let forced =
                     old.is_some_and(|old| !self.source.is_ancestor(old, new).unwrap_or(true));
-                self.export_instance(&branch, new, forced)
+                let over = if forced {
+                    BranchOver::ForcePush
+                } else {
+                    BranchOver::Push
+                };
+                self.export_instance(&branch, new, over, None)
             }
             None => Vec::new(),
         };
@@ -9858,6 +12115,19 @@ impl BranchManager {
     pub fn list_checkpoints(&self, instance: &str) -> Result<Vec<CheckpointRecord>> {
         let branch = self.store.find_branch(instance)?;
         self.checkpoint_log(&branch).list()
+    }
+
+    /// The checkpoints a removed instance named `instance` left, which
+    /// `spawn --from-checkpoint <slug>/<id>` still brings back: its name's
+    /// history, kept past the removal. Errors as an unknown instance would
+    /// when there is neither a live instance nor any checkpoint by the name.
+    pub fn removed_checkpoints(&self, instance: &str) -> Result<Vec<CheckpointRecord>> {
+        let slug = branch_slug(instance);
+        let records = CheckpointLog::new(self.store.checkpoint_dir(&slug), instance).list()?;
+        if records.is_empty() {
+            return Err(NewgitError::UnknownBranchInstance(instance.to_owned()));
+        }
+        Ok(records)
     }
 
     /// Prove a restore actually works instead of trusting it: checkpoint the
@@ -10009,6 +12279,31 @@ impl BranchManager {
         message: Option<&str>,
         reason: CheckpointReason,
     ) -> Result<CheckpointOutcome> {
+        // A checkpoint writes its store ref before its record. One that
+        // fails between the two leaves a ref no record names, holding the
+        // workspace's objects: deleted here, so a retry does not pile them up.
+        let log = self.checkpoint_log(branch);
+        let id = log.next_id()?;
+        let taken = self.take_checkpoint(branch, message, reason);
+        if taken.is_err() {
+            let store_ref = format!("refs/newgit/checkpoints/{}/{id}", branch.slug);
+            let recorded = log
+                .list()
+                .map(|records| records.iter().any(|record| record.id == id))
+                .unwrap_or(true);
+            if !recorded && self.source.ref_rev(&store_ref).is_some() {
+                let _ = self.source.delete_ref(&store_ref);
+            }
+        }
+        taken
+    }
+
+    fn take_checkpoint(
+        &self,
+        branch: &mut BranchInstance,
+        message: Option<&str>,
+        reason: CheckpointReason,
+    ) -> Result<CheckpointOutcome> {
         debug_assert!(
             self.held_lock(&branch.slug).is_some(),
             "a checkpoint is taken under the instance's lock"
@@ -10092,6 +12387,7 @@ impl BranchManager {
         // that reads an export is not a claim about capture order (#43).
         let mut resource_states = Vec::new();
         let mut degraded = Vec::new();
+        let mut capture_failures = BTreeMap::new();
         let mut deposits: Vec<(String, String)> = Vec::new();
         for name in self.graph.lifecycle_order.iter().rev() {
             let Some(binding) = branch.resources.get(name) else {
@@ -10124,15 +12420,26 @@ impl BranchManager {
                 ));
                 degraded.push(name.clone());
                 CapturedResource::none()
-            } else if binding.status != ResourceStatus::Ready {
+            } else if binding.status != ResourceStatus::Ready || reason == CheckpointReason::Remove
+            {
+                // And the one `remove` takes: an unattended removal must not
+                // be refused by a database that is down. What it cannot
+                // capture is named as lost instead.
                 match self.checkpoint_resource(branch, definition, "checkpoint") {
                     Ok(captured) => captured,
                     Err(error) => {
-                        warnings.push(format!(
-                            "resource `{name}` is not up and its capture failed ({error}), so \
-                             this checkpoint is degraded — undoing to it leaves `{name}` as it is"
-                        ));
+                        let why = capture_failure(&error);
+                        // `remove` says it itself, with what it did about
+                        // the state (`RemoveOutcome::left`).
+                        if reason != CheckpointReason::Remove {
+                            warnings.push(format!(
+                                "resource `{name}` is not up and its capture failed ({why}), \
+                                 so this checkpoint is degraded — undoing to it leaves `{name}` \
+                                 as it is"
+                            ));
+                        }
                         degraded.push(name.clone());
+                        capture_failures.insert(name.clone(), why);
                         CapturedResource::none()
                     }
                 }
@@ -10194,6 +12501,7 @@ impl BranchManager {
                     // shared, and the rev recorded here is what an undo
                     // re-renders on top of, so it has to hold the committed
                     // values a render's `find` matches.
+                    let seal = self.seal_for(definition, Some(branch))?;
                     let reversed = self.unrender_for_capture(branch, definition)?;
                     let capture = self.lane(&definition.name).capture(
                         &workspace,
@@ -10202,11 +12510,45 @@ impl BranchManager {
                             parent: bound.as_deref(),
                             branch: Branch::Instance(&branch.slug),
                             message: &format!("{} in `{}` at {id}", definition.name, branch.name),
+                            seal: seal.as_ref(),
                         },
                     );
                     reversed.restore()?;
                     Some(capture?.rev)
                 };
+            // About to be synced: a rev of an encrypted tracker this
+            // capture did not make (a dropped one, a deposit's), or made
+            // offline, is encrypted again if the audience changed since
+            // (#338). Without the remote it stays as it is, and the sync,
+            // which checks again, does not send it.
+            let content_rev = match content_rev {
+                // Not for `remove`'s checkpoint, which is never synced: a
+                // removal never waits on the network.
+                Some(rev)
+                    if definition.encrypted_to_audience()
+                        && self.remote.is_some()
+                        && reason != CheckpointReason::Remove =>
+                {
+                    match self.sealed_to_current(
+                        definition,
+                        &rev,
+                        Some(branch),
+                        Branch::Instance(&branch.slug),
+                        &format!(
+                            "{} in `{}` at {id}, encrypted to its audience",
+                            definition.name, branch.name
+                        ),
+                    ) {
+                        Ok(current) => Some(current),
+                        // Kept for the sync's refusal to say.
+                        Err(error) => {
+                            self.note_reseal_failure(&definition.name, error.to_string());
+                            Some(rev)
+                        }
+                    }
+                }
+                other => other,
+            };
             branch.trackers.insert(
                 definition.name.clone(),
                 TrackerBinding {
@@ -10224,10 +12566,13 @@ impl BranchManager {
         let record = CheckpointRecord {
             id,
             branch: branch.name.clone(),
+            instance: Some(branch.id.clone()),
             created_at: Utc::now(),
             message: message.map(ToOwned::to_owned),
             reason,
             undo_completed: None,
+            restore_of: None,
+            restored: false,
             source: SourceState {
                 head_rev,
                 dirty_rev,
@@ -10247,7 +12592,15 @@ impl BranchManager {
         // The checkpoint exists locally now, whatever happens next; syncing
         // it is what lets another machine spawn it.
         let mut left_out = Vec::new();
-        let sync_error = match self.sync_checkpoint(branch, &record) {
+        let mut sync_refused = false;
+        // Except the one `remove` takes: the instance leaves the remote
+        // right after, and a removal must not wait on the network.
+        let synced = if reason == CheckpointReason::Remove {
+            Ok(Vec::new())
+        } else {
+            self.sync_checkpoint(branch, &record)
+        };
+        let sync_error = match synced {
             Ok(refused) => {
                 for (tracker, reason) in refused {
                     warnings.push(format!(
@@ -10262,6 +12615,12 @@ impl BranchManager {
                 None
             }
             Err(error) => {
+                sync_refused = matches!(
+                    error,
+                    NewgitError::Encryption { .. }
+                        | NewgitError::PlaintextRefused(_)
+                        | NewgitError::SplitRefused(_)
+                );
                 warnings.push(format!(
                     "checkpoint {} is saved here but not on the remote: {error}",
                     record.id
@@ -10275,8 +12634,10 @@ impl BranchManager {
             record_path,
             warnings,
             sync_error,
+            sync_refused,
             left_out,
             degraded,
+            capture_failures,
         })
     }
 
@@ -10555,6 +12916,11 @@ impl BranchManager {
         };
         let list = crate::compose::index(&project, &self.root.name, &merged_root)?;
         let incoming = crate::compose::index(&project, &self.root.name, &theirs)?;
+        let pairs: Vec<(&str, &str)> = list
+            .iter()
+            .map(|(tracker, commit)| (tracker.as_str(), commit.as_str()))
+            .collect();
+        self.refuse_dropped(&pairs, &format!("merging `{name}` into `{into}`"))?;
 
         // Each tracker: what happened to it.
         let mut trackers = Vec::new();
@@ -10616,6 +12982,11 @@ impl BranchManager {
                 None => merge.commit.clone(),
                 Some(main) if self.source.is_ancestor(&merge.commit, main)? => continue,
                 Some(main) if self.source.is_ancestor(main, &merge.commit)? => merge.commit.clone(),
+                // Its line was reset here (`pull --remote --force`, #442):
+                // `main` is the old line, replaced, never merged back in.
+                Some(main) if self.reset_replaces(&merge.tracker, main, &merge.commit)? => {
+                    merge.commit.clone()
+                }
                 Some(main) => match self.merge_commits(
                     main,
                     &merge.commit,
@@ -10638,10 +13009,11 @@ impl BranchManager {
         }
 
         let mut anchor = None;
-        let mut pull = None;
         // What root is once this merge is in: its own commit, unless it
         // landed below root and root rolled up to something more.
         let mut landed_root = merged_root.clone();
+        // What landed in each tracker, when the remote merged it.
+        let mut landed_list: Option<BTreeMap<String, String>> = None;
         if !moved.is_empty()
             && let Some((client, project_key)) = &client
         {
@@ -10722,16 +13094,7 @@ impl BranchManager {
             // The remote asks Git how each pin moves; whether this merge may
             // make each move is its call, not ours. Without the upload it
             // hands a write password for each tracker it may move.
-            // Named so the landing marks the instance's pull request merged.
-            let instance = (name != PROJECT_ROOT_INSTANCE).then(|| branch_slug(&name));
-            let begun = client.begin_merge(
-                project_key,
-                into,
-                &base,
-                &list,
-                uploaded,
-                instance.as_deref(),
-            )?;
+            let begun = client.begin_merge(project_key, into, &base, &list, uploaded)?;
             anchor = begun.anchor.clone();
             let credentials = begun.credentials;
             let writes = begun.writes;
@@ -10799,26 +13162,30 @@ impl BranchManager {
             // The commit point, and the only one: the remote moves the list
             // by compare-and-swap, then root's branch and each move follow.
             let landed = client.finish_merge(project_key, into, &base, &list, &ref_moves)?;
-            pull = landed.pull;
             warnings.extend(landed.behind);
             // Where it landed is the finish's to say: `begin` cannot read
             // the merge's commits yet, which arrive after it.
             anchor = landed.anchor.or(anchor);
-            // Landed below root: root rolled up to it on the remote, perhaps
-            // with other landings beside it, so root is now the remote's,
-            // not this merge's own commit. Bring that here, and everything
-            // it pins, so the next spawn starts from what landed: two merges
-            // at once would otherwise each leave only their own.
+            // Merged on the remote onto what landed since this merge's base,
+            // or landed below root and rolled up to (the Worker): root is
+            // now the remote's, not this merge's own commit. Bring that
+            // here, and everything it pins, so the next spawn starts from
+            // what landed: two merges at once would otherwise each leave
+            // only their own.
             // The merge has landed whatever happens here, so a failure is
             // said, not taken for the merge failing.
-            if anchor
-                .as_deref()
-                .is_some_and(|anchor| anchor != self.root.name)
+            if landed.merged
+                || anchor
+                    .as_deref()
+                    .is_some_and(|anchor| anchor != self.root.name)
             {
                 match self.branch_list(Some((client.as_ref(), project_key.as_str())), into) {
                     Ok(after) => {
                         if let Some(root) = after.get(&self.root.name) {
                             landed_root = root.clone();
+                        }
+                        if landed.merged {
+                            landed_list = Some(after);
                         }
                     }
                     Err(error) => warnings.push(format!(
@@ -10867,7 +13234,13 @@ impl BranchManager {
         }
         let updates: Vec<(String, String)> = children
             .iter()
-            .map(|(tracker, commit)| (local_tracker_ref(tracker, into), (*commit).to_owned()))
+            .map(|(tracker, commit)| {
+                let commit = landed_list
+                    .as_ref()
+                    .and_then(|landed| landed.get(*tracker))
+                    .map_or(*commit, String::as_str);
+                (local_tracker_ref(tracker, into), commit.to_owned())
+            })
             .collect();
         self.source.update_refs(&updates)?;
         let published: Vec<(&str, &str)> = std::iter::once(self.root.name.as_str())
@@ -10887,6 +13260,30 @@ impl BranchManager {
         } else {
             None
         };
+        // Merged on the remote: what landed in each tracker is the remote's
+        // to say, not this merge's own commits.
+        let server_merged = landed_list.is_some();
+        if let Some(landed) = &landed_list {
+            trackers = landed
+                .iter()
+                .filter(|(tracker, commit)| {
+                    base.get(*tracker) != Some(*commit)
+                        && (list.get(*tracker) == Some(*commit)
+                            || list.get(*tracker) != base.get(*tracker))
+                })
+                .map(|(tracker, commit)| TrackerMerge {
+                    tracker: tracker.clone(),
+                    action: if !base.contains_key(tracker) {
+                        TrackerMergeAction::New
+                    } else if list.get(tracker) == Some(commit) {
+                        TrackerMergeAction::FastForward
+                    } else {
+                        TrackerMergeAction::Merged
+                    },
+                    commit: commit.clone(),
+                })
+                .collect();
+        }
         Ok(MergeOutcome {
             instance: name,
             into: into.to_owned(),
@@ -10896,7 +13293,7 @@ impl BranchManager {
             trackers,
             remote: client.map(|(_, project)| project),
             anchor,
-            pull,
+            server_merged,
         })
     }
 
@@ -10951,10 +13348,13 @@ impl BranchManager {
                 wants.push_str(&format!("^{have}\n"));
             }
             let pack = crate::objects::run(
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(repo.as_str())
-                    .args(["pack-objects", "--revs", "--thin", "--stdout", "-q"]),
+                crate::git::command().arg("-C").arg(repo.as_str()).args([
+                    "pack-objects",
+                    "--revs",
+                    "--thin",
+                    "--stdout",
+                    "-q",
+                ]),
                 "git pack-objects",
                 Some(wants.as_bytes()),
             )?;
@@ -11130,6 +13530,59 @@ impl BranchManager {
         Ok(Some(merged))
     }
 
+    /// [`Self::merge_commits`] for a pull: the merge of `ours` with an export
+    /// target's `theirs` is the same commit wherever it is made. It is
+    /// newgit's, made on nobody's behalf ([`crate::source::NEWGIT_NAME`], as
+    /// an endpoint's `Merge main from github` is), dated as the parent
+    /// committed last (`theirs` on a tie), and never signed. So two
+    /// instances pulling the same two tips make one commit, and merging both
+    /// lands one merge, not three. Unsigned, it is refused by a target that
+    /// requires signed commits (docs/design/trackers.md).
+    fn merge_pulled(
+        &self,
+        ours: &str,
+        theirs: &str,
+        message: &str,
+    ) -> Result<std::result::Result<String, Vec<String>>> {
+        let project = self.store.paths().project_root.clone();
+        let dated = |commit: &str| -> Result<(i64, String)> {
+            let line = crate::source::run_git_env(
+                &[
+                    "-C",
+                    project.as_str(),
+                    "log",
+                    "-1",
+                    "--format=%ct%x00%cd",
+                    "--date=raw",
+                    commit,
+                ],
+                &[],
+            )?;
+            let (time, date) = line.trim().split_once('\0').unwrap_or_default();
+            Ok((time.parse().unwrap_or(0), date.to_owned()))
+        };
+        let ours_at = dated(ours)?;
+        let theirs_at = dated(theirs)?;
+        let (_, date) = if ours_at.0 > theirs_at.0 {
+            ours_at
+        } else {
+            theirs_at
+        };
+        let mut env: Vec<(String, String)> = [
+            ("GIT_AUTHOR_NAME", crate::source::NEWGIT_NAME),
+            ("GIT_AUTHOR_EMAIL", crate::source::NEWGIT_EMAIL),
+            ("GIT_AUTHOR_DATE", date.as_str()),
+            ("GIT_COMMITTER_NAME", crate::source::NEWGIT_NAME),
+            ("GIT_COMMITTER_EMAIL", crate::source::NEWGIT_EMAIL),
+            ("GIT_COMMITTER_DATE", date.as_str()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        env.extend(crate::source::config_env(&[("commit.gpgSign", "false")]));
+        crate::source::merge_commits(&project, ours, theirs, message, &env)
+    }
+
     fn merge_commits(
         &self,
         ours: &str,
@@ -11164,6 +13617,19 @@ impl BranchManager {
 
         let view = remote.project(project)?;
         let main = view.default_list().cloned().unwrap_or_default();
+        // Nothing the remote's `main` lacks that a reset dropped (#442): an
+        // instance still on the old line keeps it here, never sends it.
+        let sending: Vec<(&str, &str)> = tip
+            .iter()
+            .flat_map(|(tracker, tip_commit)| {
+                [Some(tip_commit), head.get(tracker)]
+                    .into_iter()
+                    .flatten()
+                    .filter(|commit| main.get(tracker) != Some(*commit))
+                    .map(move |commit| (tracker.as_str(), commit.as_str()))
+            })
+            .collect();
+        self.refuse_dropped(&sending, "sending this checkpoint to the remote")?;
         let mut shared = None;
         for (tracker, tip_commit) in &tip {
             let head_commit = head.get(tracker).unwrap_or(tip_commit);
@@ -11459,38 +13925,12 @@ impl BranchManager {
         })
     }
 
-    /// `newgit pull <tracker>`: one view commit in `instance` (the project
-    /// root when `None`) that moves `tracker`'s pin to its `follow` ref —
-    /// `Pull t3code: 14 commits from main` — authored by whoever runs it.
-    /// It holds the tracker's files at the new pin, and merges into
-    /// `main` like any instance commit. The workspace fast-forwards to it.
-    pub fn pull(&self, instance: Option<&str>, tracker: &str) -> Result<PullOutcome> {
-        self.require_migrated()?;
-        let definition = self
-            .carved
-            .iter()
-            .find(|definition| definition.name == tracker)
-            .cloned()
-            .ok_or_else(|| {
-                NewgitError::Unsupported(format!(
-                    "`{tracker}` is not a tracker in Git mounted here: `newgit pull` moves a \
-                     mounted tracker's pin"
-                ))
-            })?;
-        let new = self.follow_commit(&definition)?.ok_or_else(|| {
-            NewgitError::Unsupported(format!(
-                "`{tracker}` has no `{}` to pull here",
-                definition.follow
-            ))
-        })?;
-        self.move_pin(instance, &definition, &new, &definition.follow, &[])
-    }
-
     /// Move `definition`'s pin in `instance` (the project root when `None`)
     /// to `new`, which came from `from` (a ref, or a target): one view
     /// commit, `Pull <tracker>: N commits from <from>`, authored by whoever
-    /// runs it, holding the tracker's files at `new`. Nothing
-    /// when the pin already has `new`.
+    /// runs it, holding the tracker's files at `new`, after which `mains`
+    /// land on the trackers' `main`. Nothing when the pin already has `new`.
+    /// How many commits came in, and the view commit.
     fn move_pin(
         &self,
         instance: Option<&str>,
@@ -11498,8 +13938,58 @@ impl BranchManager {
         new: &str,
         from: &str,
         mains: &[(String, String)],
-    ) -> Result<PullOutcome> {
+    ) -> Result<(usize, Option<String>)> {
         let tracker = definition.name.as_str();
+        let (slug, workspace, base) = self.pull_base(instance)?;
+        let (pins, index) = self.base_pins(&base)?;
+        let Some(old) = pins.get(tracker).cloned() else {
+            let path = crate::tracker::tracker_path(tracker);
+            return Err(NewgitError::Unsupported(match &definition.parent {
+                // Its pin is its parent's commit, which plain pull makes.
+                Some(parent) if index.contains_key(tracker) => format!(
+                    "`{path}` is mounted inside `{}`, so its pin moves in a commit of that \
+                     tracker, not of root: `newgit pull {path}` takes what is new on its export \
+                     target",
+                    crate::tracker::tracker_path(parent)
+                ),
+                _ => format!(
+                    "root does not mount `{path}` at {}: commit its definition first",
+                    &base[..12]
+                ),
+            }));
+        };
+        if self.pin_move(tracker, &old, new)? == PinMove::UpToDate {
+            self.land_tracker_branches(
+                mains
+                    .iter()
+                    .map(|(tracker, main)| (tracker.as_str(), main.as_str())),
+                "main",
+            )?;
+            return Ok((0, None));
+        }
+        let commits = self.commits_between(&old, new)?;
+        let message = format!(
+            "Pull {tracker}: {commits} commit{} from {from}",
+            if commits == 1 { "" } else { "s" },
+        );
+        let moved = [(tracker.to_owned(), new.to_owned())];
+        let view = self.commit_pins(
+            &slug,
+            workspace.as_deref(),
+            &base,
+            &moved,
+            &message,
+            definition.mount.as_str(),
+            mains,
+            &moved,
+        )?;
+        Ok((commits, Some(view)))
+    }
+
+    /// Where a pull in `instance` (the project root when `None`) starts: the
+    /// instance's slug, its workspace (none for the project root), and the
+    /// root commit its work splits to, which the pull's commit goes on.
+    fn pull_base(&self, instance: Option<&str>) -> Result<(String, Option<Utf8PathBuf>, String)> {
         let project = self.store.paths().project_root.clone();
         let (slug, workspace, head) = match instance {
             Some(instance) if instance != PROJECT_ROOT_INSTANCE => {
@@ -11537,89 +14027,81 @@ impl BranchManager {
             &self.root.name,
             &format!("instances/{slug}"),
         ))?;
-        let index = crate::compose::index(&project, &self.root.name, &base)?;
-        let pins = {
-            let mut objects = crate::objects::Objects::open(&project)?;
-            let commit = objects.commit(&base)?;
-            crate::compose::pins_in(&mut objects, &commit.tree)?
-        };
-        let Some(old) = pins.get(tracker).cloned() else {
-            return Err(NewgitError::Unsupported(format!(
-                "root does not mount `{tracker}` at {}: {}",
-                &base[..12],
-                if index.contains_key(tracker) {
-                    "it is mounted deeper; pull it in the tracker that mounts it"
-                } else {
-                    "commit its definition first"
-                }
-            )));
-        };
-        let new = new.to_owned();
-        // A fast-forward lands on the pin, so its commits can be counted
-        // from here. Anything else could be a pin moving backwards, which
-        // only the history can tell.
-        if new != old && !self.source.is_ancestor(&old, &new)? {
-            self.need_history(tracker)?;
+        Ok((slug, workspace, base))
+    }
+
+    /// The pins root commit `base` holds itself, and every tracker it holds
+    /// at any depth.
+    fn base_pins(&self, base: &str) -> Result<(BTreeMap<String, String>, crate::compose::State)> {
+        let project = self.store.paths().project_root.clone();
+        let index = crate::compose::index(&project, &self.root.name, base)?;
+        let mut objects = crate::objects::Objects::open(&project)?;
+        let commit = objects.commit(base)?;
+        let pins = crate::compose::pins_in(&mut objects, &commit.tree)?;
+        Ok((pins, index))
+    }
+
+    /// How `tracker`'s pin would move from `old` to `new`. A fast-forward
+    /// lands on the pin, so it can be told from here. Anything else could
+    /// be a pin moving backwards, which only the history can tell.
+    fn pin_move(&self, tracker: &str, old: &str, new: &str) -> Result<PinMove> {
+        if new == old {
+            return Ok(PinMove::UpToDate);
         }
-        if new == old || self.source.is_ancestor(&new, &old)? {
-            self.land_tracker_branches(
-                mains
-                    .iter()
-                    .map(|(tracker, main)| (tracker.as_str(), main.as_str())),
-                "main",
-            )?;
-            return Ok(PullOutcome {
-                tracker: tracker.to_owned(),
-                follow: from.to_owned(),
-                commits: 0,
-                view: None,
-            });
+        if self.source.is_ancestor(old, new)? {
+            return Ok(PinMove::Forward);
         }
-        let commits: usize = crate::source::run_git_env(
+        self.need_history(tracker)?;
+        Ok(if self.source.is_ancestor(new, old)? {
+            PinMove::UpToDate
+        } else if self.source.is_ancestor(old, new)? {
+            PinMove::Forward
+        } else {
+            PinMove::Diverged
+        })
+    }
+
+    /// How many commits `new` has that `old` does not.
+    fn commits_between(&self, old: &str, new: &str) -> Result<usize> {
+        let project = self.store.paths().project_root.clone();
+        Ok(crate::source::run_git_env(
             &[
                 "-C",
                 project.as_str(),
                 "rev-list",
                 "--count",
-                &new,
+                new,
                 "--not",
-                &old,
+                old,
             ],
             &[],
         )?
         .trim()
         .parse()
-        .unwrap_or(0);
-        let tree = {
-            let mut objects = crate::objects::Objects::open(&project)?;
-            let commit = objects.commit(&base)?;
-            let tree = objects.set_path(
-                &commit.tree,
-                &format!("{}/{tracker}", crate::compose::PINS_DIR),
-                Some((crate::objects::GITLINK_MODE.to_vec(), new.clone())),
-            )?;
-            objects.flush()?;
-            tree
-        };
-        let message = format!(
-            "Pull {tracker}: {commits} commit{} from {from}",
-            if commits == 1 { "" } else { "s" },
-        );
-        let pulled = crate::source::run_git_env(
-            &[
-                "-C",
-                project.as_str(),
-                "commit-tree",
-                &tree,
-                "-p",
-                &base,
-                "-m",
-                &message,
-            ],
-            &[],
-        )?
-        .trim()
-        .to_owned();
+        .unwrap_or(0))
+    }
+
+    /// One view commit on root commit `base` of instance `slug` that moves
+    /// each pin in `moved` (`(tracker, new)`), with `message`, authored by
+    /// whoever runs it. The workspace (the project root when `None`) takes
+    /// it before any branch moves, then `mains` land on the trackers'
+    /// `main`, and `land` (every tracker's new commit, at any depth) on
+    /// their branch for this instance. `mounts` names where the moved
+    /// trackers sit, for the error when the workspace cannot take it.
+    /// Returns the view commit.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_pins(
+        &self,
+        slug: &str,
+        workspace: Option<&Utf8Path>,
+        base: &str,
+        moved: &[(String, String)],
+        message: &str,
+        mounts: &str,
+        mains: &[(String, String)],
+        land: &[(String, String)],
+    ) -> Result<String> {
+        let pulled = self.pin_commit(base, moved, message)?;
         // Composed to a ref of its own, and taken by the workspace, before
         // any branch moves: a working tree that cannot take it leaves every
         // ref as it was, so the pull can simply run again.
@@ -11627,7 +14109,7 @@ impl BranchManager {
         let view = self
             .compose_here(&view_ref, &pulled)?
             .ok_or_else(|| NewgitError::Unsupported("the pull composes to nothing".to_owned()))?;
-        let taken = self.take_pull(workspace.as_deref(), definition, &view_ref, &view);
+        let taken = self.take_pull(workspace, mounts, &view_ref, &view);
         let _ = self.source.delete_ref(&view_ref);
         taken?;
         self.land_tracker_branches(
@@ -11636,13 +14118,49 @@ impl BranchManager {
                 .map(|(tracker, main)| (tracker.as_str(), main.as_str())),
             "main",
         )?;
-        self.land_root_commit(&slug, &pulled, &[(tracker.to_owned(), new.clone())], &view)?;
-        Ok(PullOutcome {
-            tracker: tracker.to_owned(),
-            follow: from.to_owned(),
-            commits,
-            view: Some(view),
-        })
+        self.land_root_commit(slug, &pulled, land, &view)?;
+        Ok(view)
+    }
+
+    /// A commit on `parent`, a commit of any tracker in Git, moving each of
+    /// its pins in `moved` (`(name in its tree, new)`), with `message`,
+    /// authored by whoever runs it.
+    fn pin_commit(
+        &self,
+        parent: &str,
+        moved: &[(String, String)],
+        message: &str,
+    ) -> Result<String> {
+        let project = self.store.paths().project_root.clone();
+        let tree = {
+            let mut objects = crate::objects::Objects::open(&project)?;
+            let commit = objects.commit(parent)?;
+            let mut tree = commit.tree.clone();
+            for (name, new) in moved {
+                tree = objects.set_path(
+                    &tree,
+                    format!("{}/{name}", crate::compose::PINS_DIR),
+                    Some((crate::objects::GITLINK_MODE.to_vec(), new.clone())),
+                )?;
+            }
+            objects.flush()?;
+            tree
+        };
+        Ok(crate::source::run_git_env(
+            &[
+                "-C",
+                project.as_str(),
+                "commit-tree",
+                &tree,
+                "-p",
+                parent,
+                "-m",
+                message,
+            ],
+            &[],
+        )?
+        .trim()
+        .to_owned())
     }
 
     /// Fast-forward `workspace` (the project root when `None`) to the pull's
@@ -11650,7 +14168,7 @@ impl BranchManager {
     fn take_pull(
         &self,
         workspace: Option<&Utf8Path>,
-        definition: &TrackerDefinition,
+        mounts: &str,
         view_ref: &str,
         view: &str,
     ) -> Result<()> {
@@ -11677,8 +14195,8 @@ impl BranchManager {
                 .map_err(|error| {
                     NewgitError::Unsupported(format!(
                         "the workspace could not take the pull (uncommitted changes under \
-                         `{}`?), so nothing moved: commit or stash them and pull again: {error}",
-                        definition.mount
+                         `{mounts}`?), so nothing moved: commit or stash them and pull again: \
+                         {error}"
                     ))
                 })?;
             }
@@ -11866,7 +14384,7 @@ impl BranchManager {
             let rev = |name: &str| {
                 crate::source::run_git_env(&[&store, "rev-parse", "-q", "--verify", name], &[]).ok()
             };
-            match (rev(source), rev(&sent_ref(repo, destination))) {
+            match (rev(source), rev(&self.sent_ref(repo, destination))) {
                 (Some(now), Some(sent)) => now == sent,
                 _ => false,
             }
@@ -11882,10 +14400,17 @@ impl BranchManager {
                 continue;
             };
             let _ = crate::source::run_git_env(
-                &[&store, "update-ref", &sent_ref(repo, destination), source],
+                &[
+                    &store,
+                    "update-ref",
+                    &self.sent_ref(repo, destination),
+                    source,
+                ],
                 &[],
             );
         }
+        // What the remote has changed: what a send would carry with it.
+        self.forget_unsent();
     }
 
     fn sync_checkpoint(
@@ -11927,6 +14452,9 @@ impl BranchManager {
             if definition.storage != Storage::Remote {
                 continue;
             }
+            // Nothing in plaintext, and nothing to a stale audience (#338).
+            self.refuse_plaintext(definition, rev)?;
+            self.refuse_stale(definition, rev, Some(branch))?;
             if login.is_none() {
                 login = Some(remote.me()?.login);
             }
@@ -11939,7 +14467,12 @@ impl BranchManager {
             let pin = format!("{prefix}/pins/{rev}");
             let instance = format!("{prefix}/instances/{}", branch.slug);
             let mut refspecs = vec![format!("{pin}:{pin}"), format!("+{instance}:{instance}")];
-            if definition.audience == "user" && self.lane(&state.name).main().is_some() {
+            if definition.audience == "user"
+                && let Some(main) = self.lane(&state.name).main()
+            {
+                // A per-user `main` merged while no remote was linked is
+                // plaintext: checked like everything else sent.
+                self.refuse_plaintext(definition, &main)?;
                 let main = format!("{prefix}/main");
                 refspecs.push(format!("+{main}:{main}"));
             }
@@ -11968,8 +14501,9 @@ impl BranchManager {
                 Err(error) => return Err(error),
             };
             let url = credential.remote.clone().unwrap_or_default();
+            let location = format!("--git-dir={}", self.store.paths().tracker_store);
             GitSource::push_refs(
-                &[&format!("--git-dir={}", self.store.paths().tracker_store)],
+                &tracker_push_location(&location, self.definition(&name)?),
                 &url,
                 &refspecs,
                 Some(&basic_auth_header(&credential)),
@@ -12093,6 +14627,7 @@ impl BranchManager {
                             .trackers
                             .get(tracker)
                             .and_then(|binding| binding.content_rev.clone());
+                        let seal = self.seal_for(self.definition(tracker)?, Some(branch))?;
                         let deposit = lane.deposit(
                             staging_path,
                             CaptureAt {
@@ -12102,6 +14637,7 @@ impl BranchManager {
                                     "{} checkpoint of `{}`",
                                     definition.name, branch.name
                                 ),
+                                seal: seal.as_ref(),
                             },
                         )?;
                         // A path the command echoed under {{snapshot.path}}
@@ -12416,6 +14952,15 @@ impl BranchManager {
         // running. Failures are collected into a recovery record, not fatal.
         let mut resources = Vec::new();
         let mut failures: Vec<RestoreFailure> = Vec::new();
+        let mut down_dependencies = BTreeSet::new();
+        // What a recompute rebuilt or refilled in this undo: its dependents
+        // recompute too (see `RestoreContext::rebuilt_dependency`).
+        let mut rebuilt: BTreeSet<String> = BTreeSet::new();
+        // What this undo started again, which a dependent's restore waits
+        // for; and what it did not bring back — a restore that failed, and
+        // what depends on one — which stays down.
+        let mut restarted: BTreeSet<String> = BTreeSet::new();
+        let mut not_restored: BTreeSet<String> = BTreeSet::new();
         for name in &self.graph.bind_order {
             let Some(state) = restored
                 .resource_states
@@ -12458,18 +15003,70 @@ impl BranchManager {
                     .iter()
                     .find(|pre| &pre.name == name)
                     .and_then(|pre| pre.state_ref.as_deref());
-                self.restore_resource(
-                    &mut branch,
-                    definition,
-                    state,
-                    RestoreContext {
-                        pre_undo_state_ref: pre_undo,
-                        dropped_before: dropped_before.as_ref(),
-                        force_recompute: options.force_recompute,
-                    },
-                    &mut failures,
-                    &mut warnings,
-                )?
+                let rebuilt_dependency = definition
+                    .depends_on
+                    .iter()
+                    .find(|dependency| rebuilt.contains(*dependency))
+                    .map(String::as_str);
+                // A restore that runs something may talk to what it depends
+                // on — a seed loading rows into the database — and that was
+                // just started again, not yet up. So it waits as a
+                // dependent's process does (#54), for what this undo
+                // restarted only: one that was not running before the undo
+                // is not running for its restore either, as it never was.
+                let runs_something = definition.restore.as_ref().is_some_and(|spec| {
+                    matches!(spec.mode, RestoreMode::Command | RestoreMode::Recompute)
+                });
+                let mut waits_for = definition.clone();
+                waits_for
+                    .depends_on
+                    .retain(|dependency| restarted.contains(dependency));
+                let dependencies_up = if runs_something && !waits_for.depends_on.is_empty() {
+                    self.await_dependencies(
+                        &branch,
+                        &waits_for,
+                        "restore",
+                        &supervisor,
+                        &mut down_dependencies,
+                    )
+                } else {
+                    Ok(())
+                };
+                let outcome = match dependencies_up {
+                    Err(why) => {
+                        failures.push(RestoreFailure {
+                            resource: name.clone(),
+                            detail: why,
+                            log: None,
+                            retry_with: format!(
+                                "`newgit undo {}` again once what it depends on is up",
+                                branch.name
+                            ),
+                        });
+                        ("not run: a dependency is not up".to_owned(), false, false)
+                    }
+                    Ok(()) => self.restore_resource(
+                        &mut branch,
+                        definition,
+                        state,
+                        RestoreContext {
+                            pre_undo_state_ref: pre_undo,
+                            dropped_before: dropped_before.as_ref(),
+                            rebuilt_dependency,
+                            force_recompute: options.force_recompute,
+                        },
+                        &mut failures,
+                        &mut warnings,
+                    )?,
+                };
+                let recompute = definition
+                    .restore
+                    .as_ref()
+                    .is_some_and(|spec| spec.mode == RestoreMode::Recompute);
+                if recompute && outcome.2 {
+                    rebuilt.insert(name.clone());
+                }
+                outcome
             };
             if let Some(binding) = branch.resources.get_mut(name) {
                 // Only a restore that ran something can have brought the
@@ -12478,10 +15075,21 @@ impl BranchManager {
                 // left it as it found it, so it keeps the status it came in
                 // with: a `prepare` that failed, or never ran behind a failed
                 // dependency, has still not succeeded.
+                // A failed restore says so in the record, so `status` can tell
+                // it from a failed `prepare` and name its retry: not the
+                // action that starts the process, which would serve whatever
+                // the restore left half done, but another undo.
                 if !ok {
                     binding.status = ResourceStatus::Failed;
+                    binding.restore_error = failures
+                        .iter()
+                        .rev()
+                        .find(|failure| &failure.resource == name)
+                        .map(|failure| failure.detail.clone())
+                        .or_else(|| Some("its restore failed".to_owned()));
                 } else if exercised {
                     binding.status = ResourceStatus::Ready;
+                    binding.restore_error = None;
                 }
                 // Sticky once true: this answers "has restore ever
                 // completed", not "would it complete right now". A skip (no
@@ -12493,35 +15101,88 @@ impl BranchManager {
             }
 
             let mut restart_failed = false;
-            if was_left_alone || (ok && state.was_running) {
+            // What an undo leaves when a restore fails: that resource down,
+            // and everything that depends on it down too, on purpose. A
+            // server started over state its restore left half done serves
+            // it as if it were fine, and a dependent started against it
+            // reads as up while it serves the wrong data. Each reads as not
+            // started, so `status` says so, and the next undo that restores
+            // them brings both back.
+            let held_by = definition
+                .depends_on
+                .iter()
+                .find(|dependency| not_restored.contains(*dependency))
+                .cloned();
+            if !ok {
+                not_restored.insert(name.clone());
+                if state.was_running {
+                    supervisor.mark_not_restarted(name)?;
+                }
+            } else if let Some(dependency) = held_by.filter(|_| was_left_alone || state.was_running)
+            {
+                restart_failed = true;
+                not_restored.insert(name.clone());
+                supervisor.mark_not_restarted(name)?;
+                failures.push(RestoreFailure {
+                    resource: name.clone(),
+                    detail: format!(
+                        "not restarted: `{dependency}`, which it depends on, was not restored"
+                    ),
+                    log: None,
+                    retry_with: format!(
+                        "repair `{dependency}`, then `newgit undo {}` again",
+                        branch.name
+                    ),
+                });
+            } else if was_left_alone || (ok && state.was_running) {
                 let when = if was_left_alone {
                     "before this undo"
                 } else {
                     "at checkpoint time"
                 };
-                match self.restart_long_running(&branch, definition) {
-                    Ok(true) => action_label.push_str(" + restarted"),
+                match self.restart_long_running(&branch, definition, &mut down_dependencies) {
+                    Ok(true) => {
+                        restarted.insert(name.clone());
+                        action_label.push_str(" + restarted");
+                    }
                     Ok(false) => warnings.push(format!(
                         "resource `{name}` was running {when} but has no long-running action to \
                          restart"
                     )),
+                    // The process did not come back; the resource did. Its
+                    // binding says whether `prepare` or its restore succeeded,
+                    // and marking it failed for this is a failure no start
+                    // ever clears: `status` went on calling it failed while
+                    // its retried process served. So the process reads as one
+                    // never started, which `status` names and `start` owes,
+                    // until a start succeeds.
                     Err(error) => {
                         restart_failed = true;
-                        if let Some(binding) = branch.resources.get_mut(name) {
-                            binding.status = ResourceStatus::Failed;
-                        }
+                        self.supervisor(&branch).mark_not_restarted(name)?;
+                        let retry_with = match long_running_action(definition) {
+                            Some((action, _))
+                                if definition
+                                    .autostart_action()
+                                    .is_some_and(|(autostart, _)| autostart == action) =>
+                            {
+                                format!("newgit start {}", branch.name)
+                            }
+                            Some((action, _)) => {
+                                format!("newgit action {name}.{action} {}", branch.name)
+                            }
+                            None => format!("newgit start {}", branch.name),
+                        };
                         failures.push(RestoreFailure {
                             resource: name.clone(),
                             detail: format!("restart failed: {error}"),
                             log: None,
-                            retry_with: format!("newgit action {name}.start {}", branch.name),
+                            retry_with,
                         });
                     }
                 }
             }
-            // Read only now, after a failed restore or restart has marked the
-            // resource failed, so the outcome says what the record is saved
-            // with. Dependencies come first in bind order, so theirs are
+            // Read only now, after a failed restore has marked the resource
+            // failed, so the outcome says what the record is saved with. Dependencies come first in bind order, so theirs are
             // already final too.
             resources.push(UndoResourceOutcome {
                 status: branch.resources[name].status,
@@ -12640,6 +15301,7 @@ impl BranchManager {
                     });
                 if !undo.force_recompute
                     && !key_moved
+                    && undo.rebuilt_dependency.is_none()
                     && self.produced_present(branch, definition)
                     && let Some(recorded) = state.state_ref.as_deref()
                     && recorded.starts_with(HASH_STATE_REF_PREFIX)
@@ -12705,8 +15367,14 @@ impl BranchManager {
                 let log = self
                     .store
                     .action_log_path(&branch.slug, &format!("{}.restore", definition.name));
-                let (code, captured) =
-                    self.run_one_shot(branch, definition, action, action_name, &log, true)?;
+                let (code, captured) = self.run_one_shot(
+                    branch,
+                    definition,
+                    action,
+                    action_name,
+                    &log,
+                    OneShot::Hook,
+                )?;
                 warnings.extend(Self::missing_capture_warnings(
                     &definition.name,
                     action_name,
@@ -12729,6 +15397,9 @@ impl BranchManager {
                 // A rebuild during an undo produces the same tree a spawn
                 // would have, so it is worth the same to the next instance.
                 let mut label = format!("recompute({action_name})");
+                if let Some(dependency) = undo.rebuilt_dependency {
+                    label.push_str(&format!(" after `{dependency}` was recomputed"));
+                }
                 if ok && let Some(key) = &install_key {
                     match self.admit_to_install_store(branch, definition, key) {
                         Some(report @ InstallReport::Stored { .. }) => {
@@ -12799,6 +15470,9 @@ impl BranchManager {
                 )?;
                 let (code, _) = run_captured(&command, &cwd, &env, &log)?;
                 let ok = code == 0;
+                if ok {
+                    self.supervisor(branch).mark_came_up(&definition.name);
+                }
                 if !ok {
                     failures.push(RestoreFailure {
                         resource: definition.name.clone(),
@@ -12818,14 +15492,27 @@ impl BranchManager {
     /// Invoked exactly as `newgit action <resource>.<action>` would invoke
     /// it, `workdir` included: the same process must not come back in a
     /// different directory depending on which path started it (#109).
+    ///
+    /// Once what it depends on answers, as at spawn (#54): undo restarts in
+    /// bind order, dependencies first, and a restored database that is still
+    /// coming up is not one to start a server against.
     fn restart_long_running(
         &self,
         branch: &BranchInstance,
         definition: &ResourceDefinition,
+        down: &mut BTreeSet<String>,
     ) -> Result<bool> {
         let Some((action_name, action)) = long_running_action(definition) else {
             return Ok(false);
         };
+        self.await_dependencies(
+            branch,
+            definition,
+            action_name,
+            &self.supervisor(branch),
+            down,
+        )
+        .map_err(NewgitError::Unsupported)?;
         self.start_supervised(branch, definition, action, action_name)?;
         Ok(true)
     }
@@ -12848,14 +15535,110 @@ impl BranchManager {
             .start(&definition.name, &command, &cwd, &env, &log)
     }
 
+    /// Wait for what `definition` depends on to be up before its process
+    /// starts (#54): each dependency that is up once its check passes — its
+    /// `[ready]` check, or every port its running process claims answering
+    /// (#276) — has its `[ready] timeout_seconds` (five by default) to pass
+    /// it. A started process is not a serving one, and a dependent started
+    /// against a server still compiling only moves the race into the
+    /// dependent.
+    ///
+    /// A dependency whose `autostart` action is not running is down — that
+    /// action is part of it being up — so the dependent is not started
+    /// against it. One with nothing to check is up when its `prepare`
+    /// succeeded, which the caller has checked. `Err` says which dependency
+    /// is not up, and is the reason the dependent is not started.
+    fn await_dependencies(
+        &self,
+        branch: &BranchInstance,
+        definition: &ResourceDefinition,
+        action_name: &str,
+        supervisor: &Supervisor,
+        down: &mut BTreeSet<String>,
+    ) -> std::result::Result<(), String> {
+        for dependency in &definition.depends_on {
+            let Some(binding) = branch.resources.get(dependency) else {
+                continue;
+            };
+            // Waited for once per command, not once per dependent: one that
+            // did not come up for an earlier dependent is not given its
+            // timeout again.
+            if down.contains(dependency) {
+                return Err(format!(
+                    "resource `{}` depends on `{dependency}`, which did not come up, so \
+                     `{action_name}` was not started",
+                    definition.name
+                ));
+            }
+            let Ok(dependency_definition) = self.resource_definition(dependency) else {
+                continue;
+            };
+            let running = supervisor.running_pid(dependency).is_some();
+            if !running
+                && let Some((dependency_action, _)) = dependency_definition.autostart_action()
+            {
+                return Err(format!(
+                    "resource `{}` depends on `{dependency}`, whose `{dependency_action}` is \
+                     not running, so `{action_name}` was not started — start it first with \
+                     `newgit start` or `newgit action {dependency}.{dependency_action}`",
+                    definition.name
+                ));
+            }
+            // Suspended or not, started by newgit or by hand, a dependency
+            // the dependent needs must be up: a `[ready]` check it declares
+            // is run whether or not a process of newgit's is behind it.
+            if !running && !dependency_definition.has_ready_check() {
+                continue;
+            }
+            let wait = dependency_definition.ready_timeout();
+            let deadline = std::time::Instant::now() + wait;
+            loop {
+                if running && supervisor.running_pid(dependency).is_none() {
+                    down.insert(dependency.clone());
+                    return Err(format!(
+                        "resource `{}` depends on `{dependency}`, whose process ended before it \
+                         was up, so `{action_name}` was not started",
+                        definition.name
+                    ));
+                }
+                let Some(not_yet) = self.not_up_yet(branch, dependency_definition, binding) else {
+                    break;
+                };
+                if std::time::Instant::now() >= deadline {
+                    let what = not_yet.check.unwrap_or_else(|| {
+                        format!(
+                            "not answering on {}",
+                            not_yet
+                                .ports
+                                .iter()
+                                .map(|(name, port)| format!("{name} ({port})"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    });
+                    down.insert(dependency.clone());
+                    return Err(format!(
+                        "resource `{}` depends on `{dependency}`, which is not up after {}s \
+                         ({what}), so `{action_name}` was not started — `newgit start` once it \
+                         is, or give `{dependency}` a longer `[ready] timeout_seconds`",
+                        definition.name,
+                        wait.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        Ok(())
+    }
+
     /// Start each bound resource's `autostart` action, dependencies first,
     /// as `newgit action <resource>.<action>` would. One already running is
     /// left alone and not reported. One that is not ready, is blocked, or
     /// depends on a resource whose start failed here is not started, and is
     /// reported failed with the reason: it did not come up.
     ///
-    /// Starting is not waiting: a dependent is started once its dependency's
-    /// process exists, not once it answers (#54).
+    /// A dependent starts once its dependencies answer, not merely once their
+    /// processes exist (see [`Self::await_dependencies`]).
     ///
     /// `only`, when given, limits it to those resources.
     fn autostart(
@@ -12865,6 +15648,7 @@ impl BranchManager {
     ) -> Vec<StopStartResource> {
         let supervisor = self.supervisor(branch);
         let mut failed_here = BTreeSet::new();
+        let mut down_dependencies = BTreeSet::new();
         let mut started = Vec::new();
         for definition in self.lifecycle_definitions() {
             let name = &definition.name;
@@ -12905,9 +15689,18 @@ impl BranchManager {
                     "resource `{name}` {why}, so `{action_name}` was not started"
                 ))
             } else {
-                self.start_supervised(branch, definition, action, action_name)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
+                self.await_dependencies(
+                    branch,
+                    definition,
+                    action_name,
+                    &supervisor,
+                    &mut down_dependencies,
+                )
+                .and_then(|()| {
+                    self.start_supervised(branch, definition, action, action_name)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
             };
             let (status, error) = match result {
                 Ok(()) => (StopStartStatus::Started, None),
@@ -13097,6 +15890,9 @@ impl BranchManager {
                 });
             }
         }
+        // A process whose definition was deleted by hand: stopped all the
+        // same, never to be started again.
+        resources.extend(self.stop_undefined(&branch));
         self.save_stopped_record(&branch, &record)?;
         if captured {
             branch.updated_at = Utc::now();
@@ -13105,6 +15901,9 @@ impl BranchManager {
         Ok(StopStartOutcome {
             instance: branch.name,
             resources,
+            moved_ports: Vec::new(),
+            workspace: None,
+            warnings: Vec::new(),
         })
     }
 
@@ -13120,7 +15919,46 @@ impl BranchManager {
     /// already running — started by hand since — or no longer defined is
     /// dropped without being reported: there is nothing to do for it.
     pub fn start_instance(&self, instance: &str) -> Result<StopStartOutcome> {
-        let (_lock, mut branch) = self.locked_branch(instance)?;
+        let (lock, branch) = self.locked_branch(instance)?;
+        let branch = self.recover_unmoved(branch)?;
+        // Saved copies from before this `start`; one it makes itself is
+        // said the moment it is made.
+        let mut earlier = branch.clone();
+        earlier
+            .saved_copies
+            .retain(|copy| std::fs::symlink_metadata(copy).is_ok());
+        let notices = self.saved_copy_notices(&earlier);
+        // Deleted by hand: made again, from the latest checkpoint or the
+        // source branch, before anything is started in it.
+        if branch.evicted.is_none() && std::fs::symlink_metadata(&branch.workspace_path).is_err() {
+            let (checkpoint, warnings) = self.rebuild_deleted(branch)?;
+            let branch = self.store.find_branch(instance)?;
+            let mut outcome = self.start_resources(lock, branch)?;
+            outcome.workspace = Some(WorkspaceChange::Rebuilt { checkpoint });
+            outcome.warnings.splice(0..0, warnings);
+            outcome.warnings.extend(notices);
+            return Ok(outcome);
+        }
+        let Some(checkpoint) = branch.evicted.clone() else {
+            let mut outcome = self.start_resources(lock, branch)?;
+            outcome.warnings.extend(notices);
+            return Ok(outcome);
+        };
+        let warnings = self.restore_evicted(branch, &checkpoint)?;
+        let branch = self.store.find_branch(instance)?;
+        let mut outcome = self.start_resources(lock, branch)?;
+        outcome.workspace = Some(WorkspaceChange::Restored { checkpoint });
+        outcome.warnings.splice(0..0, warnings);
+        outcome.warnings.extend(notices);
+        Ok(outcome)
+    }
+
+    /// `start` proper, once the workspace is there.
+    fn start_resources(
+        &self,
+        _lock: HeldLock,
+        mut branch: BranchInstance,
+    ) -> Result<StopStartOutcome> {
         let mut record = self.load_stopped_record(&branch)?;
         // What spawn started and that has since died on its own is owed as
         // much as what `newgit stop` stopped (#261). Owed from here on like
@@ -13136,10 +15974,18 @@ impl BranchManager {
                     .resources
                     .iter()
                     .any(|entry| entry.name == definition.name && !entry.is_resume());
-                if !owed
-                    && branch.resources.contains_key(&definition.name)
-                    && matches!(supervisor.state(&definition.name), ProcessState::Died(_))
-                {
+                // Never started, too, once its resource is up: a spawn that
+                // withheld it because a dependency was not answering yet
+                // leaves it owed to the next `start` (#54).
+                let owed_by_spawn = match supervisor.state(&definition.name) {
+                    ProcessState::Died(_) => true,
+                    ProcessState::NeverStarted => branch
+                        .resources
+                        .get(&definition.name)
+                        .is_some_and(|binding| binding.status == ResourceStatus::Ready),
+                    ProcessState::Running(_) | ProcessState::Stopped => false,
+                };
+                if !owed && branch.resources.contains_key(&definition.name) && owed_by_spawn {
                     record.resources.push(StoppedResource {
                         name: definition.name.clone(),
                         action: action.to_owned(),
@@ -13151,6 +15997,9 @@ impl BranchManager {
             return Ok(StopStartOutcome {
                 instance: branch.name,
                 resources: Vec::new(),
+                moved_ports: Vec::new(),
+                workspace: None,
+                warnings: Vec::new(),
             });
         }
         self.require_resolvable_graph()?;
@@ -13160,13 +16009,19 @@ impl BranchManager {
         let mut resources = Vec::new();
         let mut still_stopped = Vec::new();
         let mut failed_here = BTreeSet::new();
+        let mut down_dependencies = BTreeSet::new();
         let mut captured = false;
+        let mut probed = BTreeSet::new();
+        let mut report = StartReport::default();
         for definition in self.lifecycle_definitions() {
             let name = &definition.name;
-            let mut owed: Vec<&StoppedResource> = record
+            // Copies: a port moved below may add a running dependent to the
+            // record, to be restarted when the walk reaches it.
+            let mut owed: Vec<StoppedResource> = record
                 .resources
                 .iter()
                 .filter(|entry| &entry.name == name)
+                .cloned()
                 .collect();
             owed.sort_by_key(|entry| !entry.is_resume());
             for entry in owed {
@@ -13200,6 +16055,15 @@ impl BranchManager {
 
                 let (action, result) = if entry.is_resume() {
                     let result = blocked()
+                        .and_then(|()| {
+                            self.probe_claimed_ports(
+                                &mut branch,
+                                definition,
+                                &supervisor,
+                                &mut probed,
+                                &mut report,
+                            )
+                        })
                         .and_then(|()| self.run_lifecycle_action(&mut branch, definition, "resume"))
                         .map_err(|error| error.to_string())
                         .and_then(|(code, log, changed)| {
@@ -13229,6 +16093,25 @@ impl BranchManager {
                         )),
                         Some((action_name, action)) => blocked()
                             .and_then(|()| {
+                                self.probe_claimed_ports(
+                                    &mut branch,
+                                    definition,
+                                    &supervisor,
+                                    &mut probed,
+                                    &mut report,
+                                )
+                            })
+                            .and_then(|()| {
+                                self.await_dependencies(
+                                    &branch,
+                                    definition,
+                                    action_name,
+                                    &supervisor,
+                                    &mut down_dependencies,
+                                )
+                                .map_err(NewgitError::Unsupported)
+                            })
+                            .and_then(|()| {
                                 self.start_supervised(&branch, definition, action, action_name)
                             })
                             .map(|_| ())
@@ -13239,10 +16122,11 @@ impl BranchManager {
                     (action, result)
                 };
 
+                record.resources.append(&mut report.restarts);
                 let (status, error) = match result {
                     Ok(()) => (StopStartStatus::Started, None),
                     Err(error) => {
-                        still_stopped.push(entry.clone());
+                        still_stopped.push(entry);
                         failed_here.insert(name.clone());
                         (StopStartStatus::Failed, Some(error))
                     }
@@ -13264,7 +16148,294 @@ impl BranchManager {
         Ok(StopStartOutcome {
             instance: branch.name,
             resources,
+            moved_ports: report.moved_ports,
+            workspace: None,
+            warnings: report.warnings,
         })
+    }
+
+    /// Before `start` runs the first thing it owes `definition` — its
+    /// `resume`, or its long-running action when it has none — check the
+    /// ports its binding claimed, once (#441). Nothing has checked them
+    /// since spawn claimed them, and only newgit respects a claim: another
+    /// program may hold one now. One that is held moves to a free port (see
+    /// [`Self::reclaim_busy_ports`]), and what depends on the resource and
+    /// is still running is restarted to pick the new one up (see
+    /// [`Self::restart_dependents`]).
+    ///
+    /// Probed before the `resume` rather than before the process, so a
+    /// `resume` that brings up the resource's own containers on the claimed
+    /// port is not then taken for another program. Skipped while the
+    /// resource's own process runs: the port it holds is its own.
+    ///
+    /// Fails, so the resource is not started, when a held port cannot move
+    /// or the files that name it cannot be rendered again.
+    fn probe_claimed_ports(
+        &self,
+        branch: &mut BranchInstance,
+        definition: &ResourceDefinition,
+        supervisor: &Supervisor,
+        probed: &mut BTreeSet<String>,
+        report: &mut StartReport,
+    ) -> Result<()> {
+        if !probed.insert(definition.name.clone())
+            || supervisor.running_pid(&definition.name).is_some()
+        {
+            return Ok(());
+        }
+        let reclaim = self.reclaim_busy_ports(branch, definition);
+        report.warnings.extend(reclaim.warnings);
+        if !reclaim.moved.is_empty() {
+            self.restart_dependents(definition, supervisor, &reclaim.moved, report);
+        }
+        report.moved_ports.extend(reclaim.moved);
+        reclaim
+            .error
+            .map_or(Ok(()), |error| Err(NewgitError::Unsupported(error)))
+    }
+
+    /// Move each port `definition`'s binding in `branch` claims that
+    /// something is listening on to a free one: written to the binding
+    /// record, with the exports that name it and the files that render it
+    /// made again, so none points at a port whose service is somebody
+    /// else's. A resource whose ports are all free is left alone.
+    ///
+    /// Only for a resource whose process is not running (the caller has
+    /// checked), so the listener is not its own. Asks [`ports::listening`],
+    /// not the stricter [`ports::bindable`]: a port in TIME_WAIT from the
+    /// resource's own server, stopped a moment ago, is not held by anyone.
+    ///
+    /// The ports move all together or not at all, claimed and saved under
+    /// the store's port lock like [`Self::claim_ports`]: when one cannot
+    /// move, `branch` is left as it was. Once they have moved, the move is
+    /// reported even when a re-render then fails.
+    fn reclaim_busy_ports(
+        &self,
+        branch: &mut BranchInstance,
+        definition: &ResourceDefinition,
+    ) -> Reclaim {
+        let mut reclaim = Reclaim::default();
+        let busy: Vec<(String, u16)> = branch
+            .resources
+            .get(&definition.name)
+            .map(|binding| {
+                binding
+                    .resolved_ports
+                    .iter()
+                    .filter(|(_, port)| ports::listening(**port))
+                    .map(|(name, port)| (name.clone(), *port))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if busy.is_empty() {
+            return reclaim;
+        }
+        match self.claim_free_ports(branch, definition, busy) {
+            Ok(moved) => reclaim.moved = moved,
+            Err(error) => {
+                reclaim.error = Some(error.to_string());
+                return reclaim;
+            }
+        }
+
+        // What the ports reach: every export and rendered file, this
+        // resource's and its dependents', in dependency order.
+        let mut problems = Vec::new();
+        for name in self.graph.bind_order.clone() {
+            let Ok(bound_definition) = self.resource_definition(&name) else {
+                continue;
+            };
+            let Some(ports) = branch
+                .resources
+                .get(&name)
+                .map(|binding| binding.resolved_ports.clone())
+            else {
+                continue;
+            };
+            let bound_definition = bound_definition.clone();
+            let bound = self.bound_exports(branch);
+            let (exports, unresolved) =
+                self.resolve_exports(branch, &bound_definition, &ports, &bound);
+            if let Some(binding) = branch.resources.get_mut(&name) {
+                binding.resolved_exports.extend(exports);
+            }
+            if !unresolved.is_empty() {
+                reclaim.warnings.push(format!(
+                    "resource `{name}` keeps its old {}, which did not resolve after the port \
+                     moved: {}",
+                    if unresolved.len() == 1 {
+                        "export"
+                    } else {
+                        "exports"
+                    },
+                    unresolved
+                        .iter()
+                        .map(|(key, placeholder)| format!("`{key}` (`{placeholder}`)"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !bound_definition.render.is_empty()
+                && let Err(error) = self.render_resource(branch, &bound_definition)
+            {
+                problems.push(format!("re-rendering resource `{name}` failed: {error}"));
+            }
+        }
+        branch.updated_at = Utc::now();
+        if let Err(error) = self.store.save_branch_record(branch) {
+            problems.push(format!("saving the new exports failed: {error}"));
+        }
+        if !problems.is_empty() {
+            reclaim.error = Some(format!(
+                "{} moved, but {}",
+                reclaim
+                    .moved
+                    .iter()
+                    .map(MovedPort::describe)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                problems.join("; ")
+            ));
+        }
+        reclaim
+    }
+
+    /// Claim a free port for each of `busy` and save the binding, under the
+    /// port lock, all or nothing: on an error `branch` is unchanged and
+    /// nothing was saved.
+    fn claim_free_ports(
+        &self,
+        branch: &mut BranchInstance,
+        definition: &ResourceDefinition,
+        busy: Vec<(String, u16)>,
+    ) -> Result<Vec<MovedPort>> {
+        let _lock = self.store.lock_ports()?;
+        let mut used = ports::used_ports(&self.store.load_branches()?);
+        let mut claim = branch.clone();
+        let mut moved = Vec::new();
+        for (port_name, from) in busy {
+            let start = definition
+                .ports
+                .get(&port_name)
+                .map_or(from, |request| request.start);
+            let to = ports::allocate(start, &mut used).map_err(|error| {
+                NewgitError::Unsupported(format!(
+                    "port {from} (`{port_name}` of resource `{}`) is held by another \
+                     program, and no other could be claimed: {error}",
+                    definition.name
+                ))
+            })?;
+            if let Some(binding) = claim.resources.get_mut(&definition.name) {
+                binding.resolved_ports.insert(port_name.clone(), to);
+            }
+            moved.push(MovedPort {
+                resource: definition.name.clone(),
+                port: port_name,
+                from,
+                to,
+            });
+        }
+        claim.updated_at = Utc::now();
+        self.store.save_branch_record(&claim)?;
+        *branch = claim;
+        Ok(moved)
+    }
+
+    /// `definition`'s ports moved: stop what depends on it and is still
+    /// running, and owe it a start, so the walk restarts it after
+    /// `definition` with the new exports and files. A running process kept
+    /// the old port in its environment, and that port is now another
+    /// program's. Restarting is what makes the instance agree with itself
+    /// again, the way `docker compose up` recreates a service whose
+    /// configuration changed; a warning would leave it talking to a
+    /// stranger until somebody noticed.
+    ///
+    /// What depends on it is what `depends_on` reaches, as for the rest of
+    /// `start`, and those come after it in the walk. A running resource that
+    /// only reads its exports, with no `depends_on`, is named in a warning
+    /// instead: the walk may already have passed it.
+    fn restart_dependents(
+        &self,
+        definition: &ResourceDefinition,
+        supervisor: &Supervisor,
+        moved: &[MovedPort],
+        report: &mut StartReport,
+    ) {
+        let ports = moved
+            .iter()
+            .map(MovedPort::describe)
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Dependency order, so one pass reaches dependents of dependents.
+        let mut depending = BTreeSet::from([definition.name.as_str()]);
+        for dependent in self.lifecycle_definitions() {
+            if dependent
+                .depends_on
+                .iter()
+                .any(|dependency| depending.contains(dependency.as_str()))
+            {
+                depending.insert(&dependent.name);
+            }
+        }
+        let mut reading = depending.clone();
+        for name in &self.graph.bind_order {
+            if self.graph.data_edges.get(name).is_some_and(|reads| {
+                reads
+                    .keys()
+                    .any(|dependency| reading.contains(dependency.as_str()))
+            }) {
+                reading.insert(name);
+            }
+        }
+
+        for dependent in self.lifecycle_definitions() {
+            let name = &dependent.name;
+            if name == &definition.name || supervisor.running_pid(name).is_none() {
+                continue;
+            }
+            if !depending.contains(name.as_str()) {
+                if reading.contains(name.as_str()) {
+                    report.warnings.push(format!(
+                        "`{name}` reads `{}`'s exports and is still running with the old port \
+                         ({ports}); restart it to pick up the new one",
+                        definition.name
+                    ));
+                }
+                continue;
+            }
+            let Some((action, _)) = long_running_action(dependent) else {
+                report.warnings.push(format!(
+                    "`{name}` depends on `{}` and is still running with the old port \
+                     ({ports}), but it has no long-running action to restart it with",
+                    definition.name
+                ));
+                continue;
+            };
+            let signal = dependent.stop_signal();
+            let why = match supervisor.stop(name, &signal) {
+                Ok(StopOutcome::Stopped(_) | StopOutcome::NotRunning) => None,
+                Ok(StopOutcome::StillRunning(pid)) => Some(format!("pid {pid} ignored `{signal}`")),
+                Err(error) => Some(error.to_string()),
+            };
+            match why {
+                None => {
+                    report.warnings.push(format!(
+                        "`{name}` depends on `{}`, whose port moved ({ports}), so it is \
+                         restarted with the new one",
+                        definition.name
+                    ));
+                    report.restarts.push(StoppedResource {
+                        name: name.clone(),
+                        action: action.to_owned(),
+                    });
+                }
+                Some(why) => report.warnings.push(format!(
+                    "`{name}` depends on `{}`, whose port moved ({ports}), and is still running \
+                     with the old one: it could not be stopped ({why})",
+                    definition.name
+                )),
+            }
+        }
     }
 
     /// Run `suspend` or `resume` quietly, so `--json` keeps stdout to
@@ -13289,7 +16460,7 @@ impl BranchManager {
             .store
             .action_log_path(&branch.slug, &format!("{}.{action_name}", definition.name));
         let (code, found) =
-            self.run_one_shot(branch, definition, action, action_name, &log, true)?;
+            self.run_one_shot(branch, definition, action, action_name, &log, OneShot::Hook)?;
         let changed = code == 0 && Self::apply_captures(branch, &definition.name, found.found);
         Ok((code, log, changed))
     }
@@ -13573,12 +16744,26 @@ impl BranchManager {
     }
 
     fn require_workspace(&self, branch: &BranchInstance) -> Result<()> {
+        if let Some(checkpoint) = &branch.evicted
+            && !self
+                .restoring
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&branch.slug)
+        {
+            return Err(NewgitError::Unsupported(format!(
+                "the workspace for `{}` was evicted to {checkpoint}; `newgit start {}` brings \
+                 it back",
+                branch.name, branch.name
+            )));
+        }
         if branch.workspace_path.is_dir() {
             Ok(())
         } else {
             Err(NewgitError::Unsupported(format!(
-                "the workspace for `{}` is missing at {}; spawn it again or remove the instance",
-                branch.name, branch.workspace_path
+                "the workspace for `{}` is missing at {}; `newgit start {}` rebuilds it, \
+                 or `newgit remove {}` removes the instance",
+                branch.name, branch.workspace_path, branch.name, branch.name
             )))
         }
     }
@@ -13885,6 +17070,38 @@ fn rebind_hint(changes: &BTreeMap<String, Vec<Utf8PathBuf>>) -> String {
     }
 }
 
+/// What is wrong with the forks in `definitions`, held to this machine's
+/// records of what each fork started at as well as to what the definitions
+/// say now. Every fork relation a definition states is recorded as it is
+/// read, so dropping or changing `from` later doesn't lift the ceiling here.
+/// A record that can't be read or written leaves only the definitions to go
+/// by; split and the remote check again.
+fn check_fork_records(
+    store: &MetadataStore,
+    definitions: &[TrackerDefinition],
+) -> Vec<(String, String)> {
+    let git_dir = &store.paths().tracker_store;
+    let records = crate::tracker_repo::fork_records(git_dir).unwrap_or_default();
+    for definition in definitions {
+        if let Some(from) = &definition.from
+            && !records
+                .iter()
+                .any(|(fork, upstream)| fork == &definition.name && upstream == from)
+        {
+            let _ = crate::tracker_repo::record_fork(git_dir, &definition.name, from);
+        }
+    }
+    let earlier: Vec<crate::tracker::EarlierFork> = records
+        .into_iter()
+        .map(|(fork, upstream)| crate::tracker::EarlierFork {
+            fork,
+            upstream,
+            audience: None,
+        })
+        .collect();
+    crate::tracker::fork_problems(definitions, &earlier)
+}
+
 fn validate_ownership_with_replacement(
     definitions: &[TrackerDefinition],
     replacement: &TrackerDefinition,
@@ -13943,16 +17160,43 @@ pub struct TrackerMerge {
     pub commit: String,
 }
 
-/// What `newgit pull <tracker>` did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PullOutcome {
-    pub tracker: String,
-    /// The ref it pulled.
-    pub follow: String,
-    /// How many of the tracker's commits came in; none when up to date.
-    pub commits: usize,
-    /// The view commit the pull made.
-    pub view: Option<String>,
+/// What a tracker's rooted export target makes of its `main`.
+struct RootedPull {
+    /// The target's tip, split into the tracker when it mounts trackers.
+    tip: String,
+    /// The tracker's commit with the target's commits in.
+    main: String,
+    /// They came in by a real merge.
+    merged: bool,
+    /// How many commits on the target were new.
+    commits: usize,
+    /// Trackers mounted in it whose commits a split made: `(tracker, commit)`.
+    children: Vec<(String, String)>,
+    /// The target, as a merge names it: `github.com/acme/ui main`.
+    from: String,
+}
+
+/// A pull from export target `target` meeting `commit`, which adds `path`,
+/// a file of `owner`, a tracker outside Git: nothing is taken in.
+fn outside_git_on_target(commit: &str, target: &str, path: &str, owner: &str) -> NewgitError {
+    NewgitError::Unsupported(format!(
+        "commit {} on `{target}` adds `{path}`, which belongs to `{owner}`, a tracker outside \
+         Git: it is not taken in, and nothing was pulled from `{target}`. A tracker outside \
+         Git's files (secrets among them) never come in or leave through Git; take `{path}` out \
+         of that history on `{target}`, then pull again",
+        short(commit)
+    ))
+}
+
+/// How a pin would move to its `follow` ref.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinMove {
+    /// The pin already has it.
+    UpToDate,
+    /// The ref is ahead of the pin.
+    Forward,
+    /// Each has commits the other does not.
+    Diverged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13973,8 +17217,9 @@ pub struct MergeOutcome {
     /// Where it landed on the remote: the lowest tracker covering everything
     /// it touched. Root, or a tracker the trackers above roll up to.
     pub anchor: Option<String>,
-    /// The pull request the landing marked merged.
-    pub pull: Option<u64>,
+    /// The branch moved on the remote since this merge's base, and the
+    /// remote merged onto what it is now: `trackers` says what landed.
+    pub server_merged: bool,
 }
 
 /// What a person asks of a spawn beyond the defaults: `--use`, `--drop`,
@@ -14270,13 +17515,89 @@ struct PushedTag {
     annotation: Option<crate::endpoint::TagAnnotation>,
 }
 
+/// How an export moves a target's branch.
+#[derive(Debug, Clone, Copy)]
+enum PushExport<'a> {
+    /// Onto what is there: refused when the export does not descend from it.
+    Onto,
+    /// Over what is there, only while that is this commit: what newgit last
+    /// put there.
+    Replacing(&'a str),
+    /// Over whatever is there when [`BranchManager::clear_push`] checked it,
+    /// leased on that: one rewritten again in between is refused.
+    Force,
+}
+
+/// How far an instance's export may move its branch on a target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchOver {
+    /// A `git push`, or `newgit export <instance> --remote`: onto what is
+    /// there, or replacing what newgit last pushed there when its commits
+    /// were split again onto the same root commits.
+    Push,
+    /// A force-push from the workspace: replacing what newgit last pushed
+    /// there, never anything else.
+    ForcePush,
+    /// `newgit export <instance> --remote <target> --force`: over whatever
+    /// is there.
+    Force,
+}
+
+/// The target refused an instance's branch: it holds commits newgit did not
+/// put there by its record, or newgit has no record of putting any there.
+/// `unchecked`: a lease failed and newgit could not ask the target whether
+/// it still has the branch.
+fn branch_refused(
+    branch: &BranchInstance,
+    target: &str,
+    recorded: bool,
+    unchecked: Option<&str>,
+) -> NewgitError {
+    let (on, instance) = (&branch.source_ref, &branch.name);
+    let force = format!("`newgit export {instance} --remote {target} --force`");
+    let mut message = if recorded {
+        format!(
+            "`{on}` on `{target}` is not what newgit last put there (someone pushed to it \
+             directly?), so it was left as it is. {force} replaces it with this branch"
+        )
+    } else {
+        format!(
+            "`{on}` on `{target}` holds commits this branch does not, and this project has no \
+             record of newgit pushing them (they may have come from another machine, from \
+             someone else, or from a newgit older than this one), so it was left as it is. \
+             Look at what `{on}` there holds first: if nothing of it is anyone else's, {force} \
+             replaces it with this branch"
+        )
+    };
+    if let Some(error) = unchecked {
+        message.push_str(&format!(
+            " (newgit could not reach `{target}` to check whether it still has `{on}`: {error})"
+        ));
+    }
+    NewgitError::Unsupported(message)
+}
+
+/// Where every export target's refs live, `<target>/...` under it.
+const EXPORTS_REFS: &str = "refs/newgit/exports/";
+
 fn export_ref(target: &str, branch: &str) -> String {
-    format!("refs/newgit/exports/{target}/{branch}")
+    format!("{EXPORTS_REFS}{target}/{branch}")
+}
+
+/// What newgit last pushed of instance `slug`'s branch to `target`: written
+/// once the push succeeded, and the only lease a replacement of it takes.
+fn pushed_branch_ref(target: &str, slug: &str) -> String {
+    export_ref(target, &format!("pushed-branches/{slug}"))
 }
 
 /// A push Git refused because it was not a fast-forward.
 fn rejected(stderr: &str) -> bool {
     stderr.contains("non-fast-forward") || stderr.contains("[rejected]")
+}
+
+/// [`rejected`], of a failed Git command.
+fn is_rejected(error: &NewgitError) -> bool {
+    matches!(error, NewgitError::SourceCommand { stderr, .. } if rejected(stderr))
 }
 
 /// Where the project repo keeps the `branch` of a tracker in Git (`main`,
@@ -14318,6 +17639,23 @@ pub fn tracker_repo(project: &str, definition: &TrackerDefinition, login: &str) 
 /// instance shares with it.
 const ROOT_MAIN_ON_REMOTE: &str = "refs/newgit/remote-root/main";
 
+/// The leading arguments for a push from the tracker store at `location`
+/// of `definition`'s content. Age ciphertext neither deltas against
+/// anything nor compresses (each encryption is random), so for an encrypted
+/// tracker both are turned off: they found nothing, and on large files they
+/// were most of a push's time and well over a gigabyte of `pack-objects`
+/// memory (eight 40 MB captures: 21 s and 1.4 GB, now 6 s and 130 MB).
+pub(crate) fn tracker_push_location<'a>(
+    location: &'a str,
+    definition: &TrackerDefinition,
+) -> Vec<&'a str> {
+    if definition.encrypted_to_audience() {
+        vec![location, "-c", "pack.window=0", "-c", "pack.compression=0"]
+    } else {
+        vec![location]
+    }
+}
+
 /// An instance's fork of one tracker in Git on the remote.
 pub fn fork_repo(project: &str, instance: &str, tracker: &str) -> String {
     format!("{}.i.{instance}.{tracker}", project.replace('/', "."))
@@ -14326,6 +17664,15 @@ pub fn fork_repo(project: &str, instance: &str, tracker: &str) -> String {
 /// Where a fork keeps a checkpoint's commit for its tracker.
 pub fn fork_checkpoint_ref(id: &str) -> String {
     format!("refs/newgit/checkpoints/{id}")
+}
+
+/// `1 commit`, `3 commits`.
+fn plural_commits(count: usize) -> String {
+    if count == 1 {
+        "1 commit".to_owned()
+    } else {
+        format!("{count} commits")
+    }
 }
 
 fn short(rev: &str) -> &str {
@@ -14353,15 +17700,6 @@ fn off_branch_warning(
          undo returns to it, but `{own}` stays at {}. `git checkout {own}` to work on the \
          instance's branch again",
         branch.short_rev()
-    )
-}
-
-/// Where the tracker store remembers what it last sent to `repo`'s
-/// `destination`: a ref, so Git keeps the commit it names.
-fn sent_ref(repo: &str, destination: &str) -> String {
-    format!(
-        "refs/newgit/sent/{repo}/{}",
-        destination.trim_start_matches("refs/")
     )
 }
 

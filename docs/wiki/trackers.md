@@ -15,6 +15,71 @@ project, `repos` from inside `apps/t3code`, `..` to go up, and a leading `/` for
 the full path, such as `/remote/<owner>/<project>/t3code/repos`. Without `--git` a tracker stays outside Git: captured, never
 committed.
 
+Who owns a path: the longest claim that reaches a path owns it. A claim reaches a path
+under it unless a tracker mounted deeper holds the path and the claim is
+`.`, or a directory around that mount, or the claiming tracker is in Git.
+So only a tracker outside Git reaches into another's mount, with a claim
+inside it: `paths = ["apps/t3code/.env"]` owns that file just as `mount =
+"apps/t3code"`, `paths = [".env"]` would. A tracker's own `!`
+exclusions take it out of the running, and a path no reaching claim takes
+is owned by nothing. A tracker in Git that should own something inside
+another's mount is carved there, as its child.
+
+A tracker outside Git that syncs (`--storage remote`) and is not `public` is
+encrypted to its audience before anything leaves your machine: each file with
+[age](https://age-encryption.org), to the SSH keys GitHub publishes for each
+member the remote lists (`https://github.com/<login>.keys`, `ssh-ed25519` or
+`ssh-rsa`). Your workspace holds plaintext, decrypted with
+`~/.ssh/id_ed25519` or `id_rsa`, or the key `$NEWGIT_IDENTITY` names (a key
+without a passphrase, added to your GitHub account, keeps agents from
+meeting a prompt). newgit prints who it encrypts to, by key fingerprint, the
+first time and whenever that changes. `newgit members add` and `remove`
+re-encrypt `main` for the new set of members, and nothing this machine had
+not sent yet reaches the remote encrypted to someone removed since; someone
+removed can still read what the remote held while they were a member, so
+rotate those secrets. If a definition you pull would store a file this
+machine has held encrypted without encryption (the tracker turned `public`
+or into a tracker in Git, or a new `public` tracker claiming its path),
+newgit refuses to capture or send it until you run `newgit tracker
+allow-plaintext <path>`. The guard knows paths, not content: the same
+content copied or moved to another path is not held back. If `newgit tracker merge` is refused because
+someone merged since, `newgit tracker pull <tracker> --keep-mine` puts your
+version on top of theirs (yours replace theirs file by file, and files you
+deleted stay deleted; no content merge), and merging again publishes it. There is no opt-out:
+a tracker a server must read (a page the remote serves) is `public`.
+
+What that guarantees, and what it does not:
+
+- The remote, and anyone who controls its deployment, cannot read what was
+  encrypted before it acts: this holds against a remote that only stores
+  and serves.
+- A remote that acts can read what is captured afterwards. It decides
+  membership, so it can add a login whose GitHub keys then become
+  recipients, and the only signal is the fingerprints newgit prints
+  (`CHANGED`, `+ <login>`). A machine encrypting a tracker for the first
+  time has nothing to compare with.
+- The remote also serves tracker definitions, and a definition decides
+  whether a path is encrypted at all. A machine that has held a path's
+  encrypted content (captured it encrypted, or decrypted it into a
+  workspace, as a fresh clone's spawn does) refuses, as an error, to
+  capture or send that path unencrypted, whatever tracker claims it now,
+  until `newgit tracker allow-plaintext <path>` is run there. A machine
+  that has never held the content has nothing to compare against and
+  captures as the definition says. It is a confirmation step, not a
+  boundary: an agent in the workspace can run `allow-plaintext` itself.
+  It knows paths, not content: the same content copied or moved to
+  another path is not held back.
+- GitHub accounts are the key authority.
+- There is no integrity: recipients' keys are public, so the remote can
+  replace a file with content of its choosing that decrypts cleanly (signed
+  tracker commits are [#431](https://github.com/Spheroman/newgit/issues/431)).
+- File names, sizes, link targets, commit messages, authors, and dates are
+  visible.
+- Revs pushed before a tracker was encrypted stay on the remote in
+  plaintext: rotate what they held.
+- A teammate on an older newgit sees ciphertext, and a capture of theirs
+  would push plaintext.
+
 An instance works on what it binds:
 
 ```sh
@@ -26,5 +91,16 @@ newgit status                          # ready / starting / not ready, and why
 
 Trackers sharing a `role` are alternatives (`dev-db`, `staging-db`); a spawn
 picks one by `--use`, then your own default in `~/.newgit/config.toml`, then
-`priority`. A tracker can bring resources (they run only while it is bound) and
+`priority`. Add a variant as a fork, so the two share history: `newgit tracker
+create staging-db --role db --from local-db` starts at `local-db`'s `main`
+(nothing is copied), claims its paths, and is bound only when asked for. A
+fork's audience can't be wider than its upstream's, and dropping `from` later
+doesn't change that: newgit refuses it locally, and `newgit serve` serves the
+fork as its upstream's audience (against newgit.dev, only the client checks). A tracker can bring resources (they run only while it is bound) and
 `require` others.
+
+`pinned = true` holds a tracker where its parent has it: a change to it never
+rolls up into the parent by itself, and moving the pin is a change to the
+parent, for its maintainers to approve. A tracker can also live in another
+project on the remote and be mounted here too (`newgit tracker link`), with
+one history and its home's policy. `newgit reference tracker` has every key.

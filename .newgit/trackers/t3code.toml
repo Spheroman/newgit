@@ -6,3 +6,4 @@ paths = ["."]
 git = true
 priority = -1
 export = { url = "github.com/Spheroman/t3code", branch = "newgit", branches = true }
+resources = ["t3code-deps"]

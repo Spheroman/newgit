@@ -1,0 +1,90 @@
+# The pnpm install for apps/t3code (the t3code tracker), from the `pnpm`
+# template. HOST TOOLS: `node` and `corepack` on your PATH. The install
+# goes through `corepack pnpm`, not `pnpm`: t3code pins
+# `packageManager = "pnpm@12.14.0"`, and a bare `pnpm` shim (mise) is not
+# guaranteed to resolve in a workspace.
+#
+# Every instance gets its own tree; two instances at the same inputs get a
+# copy-on-write clone of one stored tree instead of a second install.
+ownership = "workspace"
+depends_on = ["pnpm-store"]
+# Commands run from the pnpm workspace root. Content paths below stay
+# relative to the newgit workspace root, as everywhere in a definition.
+workdir = "apps/t3code"
+
+[identity]
+paths = [
+  "apps/t3code/package.json",
+  "apps/t3code/pnpm-lock.yaml",
+  "apps/t3code/pnpm-workspace.yaml",
+  "apps/t3code/.pnpmfile.cjs",
+]
+# Every node_modules a t3code install writes: one per pnpm importer that has
+# dependencies. Paths are literal, so a new workspace package means a new
+# line here.
+produces = [
+  "apps/t3code/apps/desktop/node_modules",
+  "apps/t3code/apps/marketing/node_modules",
+  "apps/t3code/apps/mobile/node_modules",
+  "apps/t3code/apps/server/node_modules",
+  "apps/t3code/apps/web/node_modules",
+  "apps/t3code/evals/node_modules",
+  "apps/t3code/infra/relay/node_modules",
+  "apps/t3code/infra/task-cache/node_modules",
+  "apps/t3code/node_modules",
+  "apps/t3code/oxlint-plugin-t3code/node_modules",
+  "apps/t3code/packages/client-runtime/node_modules",
+  "apps/t3code/packages/contracts/node_modules",
+  "apps/t3code/packages/effect-acp/node_modules",
+  "apps/t3code/packages/effect-codex-app-server/node_modules",
+  "apps/t3code/packages/provider-acp-registry/node_modules",
+  "apps/t3code/packages/provider-acp/node_modules",
+  "apps/t3code/packages/provider-core/node_modules",
+  "apps/t3code/packages/provider-cursor/node_modules",
+  "apps/t3code/packages/provider-fx/node_modules",
+  "apps/t3code/packages/provider-grok/node_modules",
+  "apps/t3code/packages/provider-kiro/node_modules",
+  "apps/t3code/packages/provider-muse/node_modules",
+  "apps/t3code/packages/provider-opencode/node_modules",
+  "apps/t3code/packages/provider-pi/node_modules",
+  "apps/t3code/packages/provider-testing/node_modules",
+  "apps/t3code/packages/secret-provider-core/node_modules",
+  "apps/t3code/packages/secret-provider-definitions/node_modules",
+  "apps/t3code/packages/secret-provider-onepassword/node_modules",
+  "apps/t3code/packages/shared/node_modules",
+  "apps/t3code/packages/source-control-azure-devops/node_modules",
+  "apps/t3code/packages/source-control-bitbucket/node_modules",
+  "apps/t3code/packages/source-control-core/node_modules",
+  "apps/t3code/packages/source-control-cursor-origin/node_modules",
+  "apps/t3code/packages/source-control-definitions/node_modules",
+  "apps/t3code/packages/source-control-forgejo/node_modules",
+  "apps/t3code/packages/source-control-gitcafe/node_modules",
+  "apps/t3code/packages/source-control-github/node_modules",
+  "apps/t3code/packages/source-control-gitlab/node_modules",
+  "apps/t3code/packages/source-control-testing/node_modules",
+  "apps/t3code/packages/ssh/node_modules",
+  "apps/t3code/packages/tailscale/node_modules",
+  "apps/t3code/scripts/node_modules",
+]
+# What the lockfile cannot see: install scripts build against this platform
+# and this Node.
+key_command = "node -v && uname -sm"
+
+# VP_GIT_HOOKS=0: t3code's root `prepare` script runs `vp config`, which
+# would point this workspace's core.hooksPath at t3code's hooks — and so
+# run them on every commit to the newgit repo that mounts it.
+[actions.prepare]
+command = "VP_GIT_HOOKS=0 corepack pnpm install --frozen-lockfile"
+
+# pnpm writes the workspace's absolute path into its install state; the
+# store keeps it as `find` and renders it back for each instance.
+[[render]]
+path = "apps/t3code/node_modules/.pnpm-workspace-state-v1.json"
+replace = [{ find = "/__newgit_workspace__", with = "{{workspace}}" }]
+
+[checkpoint]
+mode = "hash"
+
+[restore]
+mode = "recompute"
+action = "prepare"

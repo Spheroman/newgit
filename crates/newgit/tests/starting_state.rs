@@ -1,7 +1,8 @@
 //! #243: a dev server that is still compiling has not failed. A running
-//! process whose port is not answering yet is `starting` -- not a problem in
-//! `spawn`'s verdict, not "not ready" in `status` -- and `spawn` waits a few
-//! seconds for it before saying so.
+//! process whose port is not answering yet is `starting` -- not "not ready"
+//! in `status` -- for as long as its `[ready] timeout_seconds` (#276), and
+//! `spawn` waits that long for it. Still not answering after that is a
+//! problem, and `spawn` exits 1.
 //!
 //! These drive the binary, since what is under test is what it prints.
 
@@ -116,50 +117,74 @@ fn json_run(repo: &Utf8Path, verb: &str) -> (Option<i32>, Value) {
     (run.status.code(), json)
 }
 
+/// Where newgit's port search starts: a port the OS just handed out, so
+/// two runs at once, or another project's tests, do not search the same
+/// range (#276).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("an OS-assigned port")
+        .port()
+}
+
 /// Listens on `web` only after `delay` seconds, like a server compiling.
 fn server(delay: u32) -> String {
     format!(
         r#"ownership = "branch"
 
 [ports]
-web = {{ start = 54700 }}
+web = {{ start = {} }}
 
 [exports]
 WEB_PORT = "{{{{ports.web}}}}"
 
 [actions.serve]
-command = "sleep {delay}; exec python3 -m http.server $WEB_PORT --bind 127.0.0.1"
+command = "sleep {delay}; exec python3 -c 'import http.server as h, socketserver as s, sys; s.ThreadingTCPServer.allow_reuse_address = True; s.ThreadingTCPServer((sys.argv[2], int(sys.argv[1])), h.SimpleHTTPRequestHandler).serve_forever()' $WEB_PORT 127.0.0.1"
 long_running = true
 autostart = true
-"#
+
+# Room for Python to start on a loaded machine; spawn returns once it does.
+[ready]
+timeout_seconds = 30
+"#,
+        free_port()
     )
 }
 
-/// Never listens at all within a test's lifetime.
-const SILENT: &str = r#"ownership = "branch"
+/// Never listens at all within a test's lifetime. Started by spawn when
+/// `autostart`, by `newgit action app.serve` when not.
+fn silent(autostart: bool, timeout_seconds: u32) -> String {
+    format!(
+        r#"ownership = "branch"
 
 [ports]
-web = { start = 54750 }
+web = {{ start = {} }}
 
 [actions.serve]
 command = "sleep 1000"
 long_running = true
-autostart = true
-"#;
+autostart = {autostart}
+
+[ready]
+timeout_seconds = {timeout_seconds}
+"#,
+        free_port()
+    )
+}
 
 #[test]
-fn a_port_that_is_not_answering_yet_is_starting_not_a_failure() {
+fn a_port_that_is_not_answering_within_its_timeout_is_starting_not_a_failure() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
-    write_resource(&store, "app", SILENT);
+    // Started by hand rather than by spawn, which would wait out the whole
+    // minute: `status` is asked well inside it.
+    write_resource(&store, "app", &silent(false, 60));
     let repo = store.paths().project_root.clone();
 
     let (code, spawned) = json_run(&repo, "spawn");
     assert_eq!(code, Some(0), "{spawned}");
-    let starting = spawned["starting"].as_array().expect("starting array");
-    assert_eq!(starting.len(), 1, "{spawned}");
-    assert_eq!(starting[0]["resource"], "app");
-    assert!(starting[0]["ports"]["web"].is_u64(), "{spawned}");
+    let run = newgit(&repo, &["action", "app.serve", "x"]);
+    assert!(run.status.success(), "{}{}", run.stdout, run.stderr);
 
     let status = newgit(&repo, &["status"]);
     assert!(status.status.success(), "{}", status.stderr);
@@ -174,18 +199,47 @@ fn a_port_that_is_not_answering_yet_is_starting_not_a_failure() {
 }
 
 #[test]
-fn the_text_spawn_says_it_is_starting_and_where_to_look() {
+fn a_port_still_not_answering_after_its_timeout_fails_spawn() {
     let (_guard, temp) = tempdir();
     let store = setup(&temp);
-    write_resource(&store, "app", SILENT);
+    write_resource(&store, "app", &silent(true, 1));
+    let repo = store.paths().project_root.clone();
+
+    let (code, spawned) = json_run(&repo, "spawn");
+    assert_eq!(code, Some(1), "{spawned}");
+    assert_eq!(spawned["starting"], json!([]), "{spawned}");
+    let problem = spawned["problems"][0].as_str().expect("a problem");
+    assert!(
+        problem.contains("`app` is not up after 1s (not answering on web (")
+            && problem.contains("its process is running")
+            && problem.contains("`[ready] timeout_seconds`"),
+        "{spawned}"
+    );
+
+    let run = newgit(&repo, &["status"]);
+    assert!(run.stdout.contains(" not ready "), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("`app` is not up after 1s"),
+        "{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn the_text_spawn_says_it_is_not_ready_and_why() {
+    let (_guard, temp) = tempdir();
+    let store = setup(&temp);
+    write_resource(&store, "app", &silent(true, 1));
     let repo = store.paths().project_root.clone();
 
     let run = newgit(&repo, &["spawn", "x"]);
-    assert!(run.status.success(), "{}{}", run.stdout, run.stderr);
-    assert!(run.stdout.contains("starting: `x`"), "{}", run.stdout);
-    assert!(run.stdout.contains("still starting"), "{}", run.stdout);
-    assert!(run.stdout.contains("`newgit status`"), "{}", run.stdout);
-    assert!(!run.stdout.contains("not ready"), "{}", run.stdout);
+    assert_eq!(run.status.code(), Some(1), "{}{}", run.stdout, run.stderr);
+    assert!(run.stdout.contains("not ready: `x`"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("`app` is not up after 1s"),
+        "{}",
+        run.stdout
+    );
 }
 
 #[test]

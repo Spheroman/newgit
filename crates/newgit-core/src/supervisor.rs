@@ -90,6 +90,20 @@ impl Death {
 /// not `exec` the command: it stays to wait on it, writes how it ended, and
 /// exits.
 ///
+/// It also holds the command's stdin open. A dev server's file watcher
+/// (`esbuild --watch`, `vite`, `tsc --watch` under some wrappers) reads
+/// end-of-file on stdin as "the terminal went away" and exits, and a
+/// wrapper process in front of it (`npm run`, `concurrently`) stays alive,
+/// so the resource reads as running while nothing serves. So the command's
+/// stdin is a pipe that never delivers data or end-of-file, the way a
+/// process manager gives one: `start` makes a FIFO, the wrapper opens it
+/// read-write on fd 3 (a writer that lives as long as the wrapper does) and
+/// read-only on fd 4, deletes it, and hands the command fd 4 as stdin with
+/// 3 and 4 closed. newgit itself does not stay running, so the wrapper,
+/// which does, is what holds the write end. When the wrapper goes (the
+/// command ended, or the group was stopped), whatever is left of the
+/// group reads end-of-file.
+///
 /// It sets no `trap`, so every process in the group keeps the default
 /// disposition for the signal `stop` sends, and the group goes down as it
 /// did before the wrapper existed. A trap would break `stop`: a signal that
@@ -108,8 +122,11 @@ impl Death {
 const WRAPPER: &str = r#"c=$NEWGIT_SUPERVISED_COMMAND
 f=$NEWGIT_SUPERVISED_EXIT
 m=$NEWGIT_SUPERVISED_STOPPING
-unset NEWGIT_SUPERVISED_COMMAND NEWGIT_SUPERVISED_EXIT NEWGIT_SUPERVISED_STOPPING
-sh -c "$c"
+i=$NEWGIT_SUPERVISED_STDIN
+unset NEWGIT_SUPERVISED_COMMAND NEWGIT_SUPERVISED_EXIT NEWGIT_SUPERVISED_STOPPING NEWGIT_SUPERVISED_STDIN
+exec 3<>"$i" 4<"$i"
+rm -f "$i"
+sh -c "$c" <&4 3>&- 4<&-
 s=$?
 if [ -e "$m" ]; then
   :
@@ -210,8 +227,7 @@ impl Supervisor {
         }
         let mut log =
             std::fs::File::create(log_path).map_err(|source| NewgitError::io(log_path, source))?;
-        writeln!(log, "[newgit] $ {command}")
-            .map_err(|source| NewgitError::io(log_path, source))?;
+        write_header(&mut log, command).map_err(|source| NewgitError::io(log_path, source))?;
         let stderr_log = log
             .try_clone()
             .map_err(|source| NewgitError::io(log_path, source))?;
@@ -228,6 +244,21 @@ impl Supervisor {
             }
         }
 
+        // The command's stdin, which the wrapper holds open (see
+        // [`WRAPPER`]). One a crashed run left behind is replaced.
+        let stdin_fifo = self.stdin_path(resource);
+        match std::fs::remove_file(&stdin_fifo) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(NewgitError::io(stdin_fifo, error));
+            }
+            _ => {}
+        }
+        nix::unistd::mkfifo(
+            stdin_fifo.as_std_path(),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .map_err(|errno| NewgitError::io(&stdin_fifo, std::io::Error::from(errno)))?;
+
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg(WRAPPER)
@@ -241,7 +272,8 @@ impl Supervisor {
             .env(
                 "NEWGIT_SUPERVISED_STOPPING",
                 self.stopping_path(resource).as_str(),
-            );
+            )
+            .env("NEWGIT_SUPERVISED_STDIN", stdin_fifo.as_str());
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -336,6 +368,74 @@ impl Supervisor {
         Ok(retired)
     }
 
+    /// When the process now running for `resource` was started: its pid
+    /// file is written once, right after the fork. `None` when nothing is
+    /// running. The clock its `[ready] timeout_seconds` runs on (#276).
+    pub fn started_at(&self, resource: &str) -> Option<std::time::SystemTime> {
+        self.running_pid(resource)?;
+        std::fs::metadata(self.pid_path(resource))
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    }
+
+    /// Note that `resource`, which runs nothing newgit supervises, was just
+    /// brought up: its `prepare`, `resume` or `restore` exited 0, or it was
+    /// bound with none to run. What [`Self::came_up_at`] reads back.
+    /// Best-effort: without it, a failing `[ready]` check is past its
+    /// timeout at once, which says less but nothing false.
+    pub fn mark_came_up(&self, resource: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        if create_dir_all(&self.state_dir).is_ok() {
+            let _ = std::fs::write(self.came_up_path(resource), format!("{now}\n"));
+        }
+    }
+
+    /// When `resource` was last brought up, by [`Self::mark_came_up`]
+    /// (milliseconds since the epoch in `<resource>.up`). For one with no
+    /// process to watch, its timeout is counted from here.
+    pub fn came_up_at(&self, resource: &str) -> Option<std::time::SystemTime> {
+        let millis = std::fs::read_to_string(self.came_up_path(resource))
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis))
+    }
+
+    fn came_up_path(&self, resource: &str) -> Utf8PathBuf {
+        self.state_dir.join(format!("{resource}.up"))
+    }
+
+    /// The log of the run `start` last began for `resource`.
+    pub fn log_path(&self, resource: &str) -> Option<Utf8PathBuf> {
+        let text = std::fs::read_to_string(self.log_record_path(resource)).ok()?;
+        let path = text.trim();
+        (!path.is_empty()).then(|| Utf8PathBuf::from(path))
+    }
+
+    /// Note that what newgit stopped for `resource` was not started again
+    /// when it should have been: an undo stops every process and restarts
+    /// what was running, and this one's restart failed. From then on it
+    /// reads as [`ProcessState::NeverStarted`], what a start held back
+    /// behind a dependency reads as (#54): down, not stopped on purpose, so
+    /// `status` names it and `start` owes it, and whichever start succeeds
+    /// next is what clears it. Only while nothing is running for it.
+    pub fn mark_not_restarted(&self, resource: &str) -> Result<()> {
+        if self.running_pid(resource).is_some() {
+            return Ok(());
+        }
+        let path = self.pid_path(resource);
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(NewgitError::io(path, error))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn mark_stopped(&self, resource: &str) -> Result<()> {
         let path = self.pid_path(resource);
         std::fs::write(&path, "stopped\n").map_err(|source| NewgitError::io(&path, source))
@@ -348,6 +448,13 @@ impl Supervisor {
     /// The wrapper's record of how the command ended: its shell status.
     fn exit_path(&self, resource: &str) -> Utf8PathBuf {
         self.state_dir.join(format!("{resource}.exit"))
+    }
+
+    /// The log of the run `start` last began for `resource`, whose first
+    /// line is the command it ran.
+    pub fn last_log(&self, resource: &str) -> Option<Utf8PathBuf> {
+        let text = std::fs::read_to_string(self.log_record_path(resource)).ok()?;
+        Some(Utf8PathBuf::from(text.trim()))
     }
 
     /// The log of the run `start` last began, for `stop`'s line.
@@ -372,6 +479,12 @@ impl Supervisor {
     /// Left by `stop` before it signals: newgit asked for this ending.
     fn stopping_path(&self, resource: &str) -> Utf8PathBuf {
         self.state_dir.join(format!("{resource}.stopping"))
+    }
+
+    /// The FIFO `start` makes for the command's stdin; the wrapper opens and
+    /// deletes it.
+    fn stdin_path(&self, resource: &str) -> Utf8PathBuf {
+        self.state_dir.join(format!("{resource}.stdin"))
     }
 }
 
@@ -543,7 +656,7 @@ pub fn run_foreground(
     }
     let mut log =
         std::fs::File::create(log_path).map_err(|source| NewgitError::io(log_path, source))?;
-    writeln!(log, "[newgit] $ {}", command_line.join(" "))
+    write_header(&mut log, &command_line.join(" "))
         .map_err(|source| NewgitError::io(log_path, source))?;
 
     let (program, args) = command_line
@@ -587,22 +700,45 @@ pub fn run_foreground(
     Ok(status.code().unwrap_or(-1))
 }
 
+/// Where a one-shot command's input comes from. Not where its output goes:
+/// `newgit action --quiet` keeps output off the terminal, and a command
+/// that reads its input still gets it (#89).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Input {
+    /// The terminal's, or whatever was piped to newgit: a command someone
+    /// asked for by name.
+    Inherit,
+    /// None: a hook newgit runs on someone's behalf, which nobody is there
+    /// to answer.
+    Closed,
+}
+
+impl Input {
+    fn stdio(self) -> Stdio {
+        match self {
+            Self::Inherit => Stdio::inherit(),
+            Self::Closed => Stdio::null(),
+        }
+    }
+}
+
 /// Run a one-shot command in the workspace with its output going to the log
-/// only — for hooks newgit runs on someone's behalf (a spawn's `prepare`, an
-/// undo's restore), whose output is noise unless they fail; the caller shows
-/// the log's tail then. Returns the exit code.
+/// only — for output nobody wants on the terminal unless the command fails
+/// (a spawn's `prepare`, `newgit action --quiet`); the caller shows the
+/// log's tail then. Returns the exit code.
 pub fn run_quiet(
     command_line: &[String],
     cwd: &Utf8Path,
     env: &[(String, String)],
     log_path: &Utf8Path,
+    input: Input,
 ) -> Result<i32> {
     if let Some(parent) = log_path.parent() {
         create_dir_all(parent)?;
     }
     let mut log =
         std::fs::File::create(log_path).map_err(|source| NewgitError::io(log_path, source))?;
-    writeln!(log, "[newgit] $ {}", command_line.join(" "))
+    write_header(&mut log, &command_line.join(" "))
         .map_err(|source| NewgitError::io(log_path, source))?;
     let (program, args) = command_line
         .split_first()
@@ -614,7 +750,7 @@ pub fn run_quiet(
         .args(args)
         .current_dir(cwd)
         .envs(env.iter().map(|(key, value)| (key, value)))
-        .stdin(Stdio::null())
+        .stdin(input.stdio())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(err))
         .status()
@@ -625,13 +761,80 @@ pub fn run_quiet(
     Ok(status.code().unwrap_or(-1))
 }
 
+/// What opens every log: the command, one `[newgit] $` line for its first
+/// line and one `[newgit] >` line for each line after, so a multi-line
+/// command reads as the command and not as the start of its output (#89).
+fn write_header(log: &mut std::fs::File, command: &str) -> std::io::Result<()> {
+    let mut lines = command.trim_end().lines();
+    writeln!(log, "{HEADER}{}", lines.next().unwrap_or_default())?;
+    for line in lines {
+        writeln!(log, "{HEADER_MORE}{line}")?;
+    }
+    Ok(())
+}
+
+const HEADER: &str = "[newgit] $ ";
+const HEADER_MORE: &str = "[newgit] > ";
+/// Where a captured run's stdout starts and ends in its log. Its stdout is
+/// the captures, which can be secrets, so [`log_tail`] leaves it out.
+const STDOUT_BEGIN: &str = "[newgit] stdout, read for captures:";
+const STDOUT_END: &str = "[newgit] stderr:";
+
+/// The command a log was written for, from the header every runner opens
+/// it with ([`write_header`]), every line of it: what to show beside a
+/// failure, since the rendered command is often the answer (a binary that
+/// is not installed, a port that is not the one expected). It is the
+/// command as `--dry-run` renders it; environment values are the shell's
+/// to expand, and are not in it.
+pub fn log_command(log_path: &Utf8Path) -> Option<String> {
+    let text = std::fs::read_to_string(log_path).ok()?;
+    let mut lines = text.lines();
+    let first = lines.next()?.strip_prefix(HEADER)?;
+    let mut command = first.strip_prefix("sh -c ").unwrap_or(first).to_owned();
+    for line in lines.map_while(|line| line.strip_prefix(HEADER_MORE)) {
+        command.push('\n');
+        command.push_str(line);
+    }
+    Some(command)
+}
+
+/// Whether a log is of a run that declared `captures`: one whose output,
+/// stdout and stderr both, went to the log and never to the terminal, so a
+/// failure has to be told from the log, `--quiet` or not.
+pub fn log_held_captures(log_path: &Utf8Path) -> bool {
+    std::fs::read_to_string(log_path)
+        .is_ok_and(|text| text.lines().any(|line| line == STDOUT_BEGIN))
+}
+
 /// The last `lines` lines of a log, for saying why a quiet hook failed.
+/// Not its header: [`log_command`] says that. Not the stdout of a run that
+/// declared `captures` either, which holds values newgit publishes as
+/// exports, a database URL with its password among them: the terminal and
+/// whatever records it never saw that stdout on a run that succeeded, and
+/// a failure does not change that. The log keeps it.
 pub fn log_tail(log_path: &Utf8Path, lines: usize) -> Vec<String> {
     let text = std::fs::read_to_string(log_path).unwrap_or_default();
-    let all: Vec<&str> = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
+    let mut all: Vec<&str> = Vec::new();
+    let mut in_header = true;
+    let mut in_stdout = false;
+    for line in text.lines() {
+        if in_header && (line.starts_with(HEADER) || line.starts_with(HEADER_MORE)) {
+            continue;
+        }
+        in_header = false;
+        if line == STDOUT_BEGIN {
+            in_stdout = true;
+            all.push("(stdout withheld: it carries this action's captures; it is in the log)");
+            continue;
+        }
+        if in_stdout {
+            in_stdout = line != STDOUT_END;
+            continue;
+        }
+        if !line.trim().is_empty() {
+            all.push(line);
+        }
+    }
     all[all.len().saturating_sub(lines)..]
         .iter()
         .map(|line| (*line).to_owned())
@@ -640,32 +843,53 @@ pub fn log_tail(log_path: &Utf8Path, lines: usize) -> Vec<String> {
 
 /// Run a one-shot shell command, capturing stdout (for state refs) while
 /// still logging both streams. Unlike `run_foreground`, output does not go
-/// to the terminal — checkpoint machinery consumes it instead.
+/// to the terminal — checkpoint machinery consumes it instead. No input:
+/// these are hooks newgit runs itself; see [`run_captured_with`].
 pub fn run_captured(
     command: &str,
     cwd: &Utf8Path,
     env: &[(String, String)],
     log_path: &Utf8Path,
 ) -> Result<(i32, String)> {
+    run_captured_with(command, cwd, env, log_path, Input::Closed)
+}
+
+/// [`run_captured`], with the command's input from `input`.
+///
+/// The log holds stdout between [`STDOUT_BEGIN`] and [`STDOUT_END`], then
+/// stderr, so [`log_tail`] can leave the captures out.
+pub fn run_captured_with(
+    command: &str,
+    cwd: &Utf8Path,
+    env: &[(String, String)],
+    log_path: &Utf8Path,
+    input: Input,
+) -> Result<(i32, String)> {
     if let Some(parent) = log_path.parent() {
         create_dir_all(parent)?;
     }
     let mut log =
         std::fs::File::create(log_path).map_err(|source| NewgitError::io(log_path, source))?;
-    writeln!(log, "[newgit] $ {command}").map_err(|source| NewgitError::io(log_path, source))?;
+    write_header(&mut log, command).map_err(|source| NewgitError::io(log_path, source))?;
 
     let output = Command::new("sh")
         .args(["-c", command])
         .current_dir(cwd)
         .envs(env.iter().map(|(key, value)| (key, value)))
-        .stdin(Stdio::null())
+        .stdin(input.stdio())
         .output()
         .map_err(|source| NewgitError::SourceCommand {
             command: format!("sh -c {command}"),
             stderr: source.to_string(),
         })?;
 
-    log.write_all(&output.stdout)
+    let mut stdout = output.stdout.clone();
+    if !stdout.is_empty() && !stdout.ends_with(b"\n") {
+        stdout.push(b'\n');
+    }
+    writeln!(log, "{STDOUT_BEGIN}")
+        .and_then(|()| log.write_all(&stdout))
+        .and_then(|()| writeln!(log, "{STDOUT_END}"))
         .and_then(|()| log.write_all(&output.stderr))
         .map_err(|source| NewgitError::io(log_path, source))?;
 
@@ -788,10 +1012,17 @@ mod tests {
         let dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
         let script = WRAPPER.replacen("sh -c \"$c\"", "kill -TERM $$\nsh -c \"$c\"", 1);
         assert_ne!(script, WRAPPER, "the wrapper still runs the command");
+        let stdin = dir.join("app.stdin");
+        nix::unistd::mkfifo(
+            stdin.as_std_path(),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("mkfifo");
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg(script)
             .env("NEWGIT_SUPERVISED_COMMAND", "sleep 30")
+            .env("NEWGIT_SUPERVISED_STDIN", stdin.as_str())
             .env("NEWGIT_SUPERVISED_EXIT", dir.join("app.exit").as_str())
             .env(
                 "NEWGIT_SUPERVISED_STOPPING",

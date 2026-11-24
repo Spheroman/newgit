@@ -23,6 +23,7 @@ lanes.
 
 - [T3 Code](t3-code.md): a newgit instance for every thread
 - [Claude Code](claude-code.md): a newgit instance for every worktree
+- [Codex](codex.md): starting a session in an instance you spawned
 
 ## Working on newgit
 

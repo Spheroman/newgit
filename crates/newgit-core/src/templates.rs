@@ -57,6 +57,11 @@ depends_on = []
 # environment lands in one process environment, so the name has to be unique
 # across the project — it is named after this resource for that reason. If
 # this is your only service and your tool insists on plain `PORT`, rename it.
+#
+# Pass every port explicitly. A dev server that finds its port taken, or a
+# tool that picks a second one for itself (`remix dev`'s, a HMR socket), scans
+# for a free one and can take a port newgit claimed for another instance.
+# Give each such port a line here and hand it over: `--port {{ports.app}}`.
 app = { start = 3100, env = "RESOURCE_PORT" }
 
 [actions.start]
@@ -69,6 +74,16 @@ autostart = true
 
 [actions.stop]
 signal = "term"
+
+# What "up" means. With no `[ready]`, it is the port answering, given five
+# seconds. A dev server that binds at once and serves errors until it has
+# compiled is up too early by that measure, and one that takes longer than
+# five seconds reads `starting`; what `depends_on` this one starts once it
+# is up. Uncomment to wait for a page that answers instead.
+#
+# [ready]
+# http = "http://127.0.0.1:{{ports.app}}/"
+# timeout_seconds = 60
 
 [exports]
 RESOURCE_URL = "http://127.0.0.1:{{ports.app}}"
@@ -192,6 +207,141 @@ action = "prepare"
 "#,
     },
     ResourceTemplate {
+        name: "postgres",
+        description: "a Postgres cluster per instance, no Docker; add it as `database` to get DATABASE_URL",
+        companions: &[],
+        // The same lane as the other database templates: a lane is per
+        // database, not per template.
+        companion_trackers: &[CompanionTracker {
+            name: "db-snapshots",
+            audience: "project-devs",
+            merge_with_source: false,
+        }],
+        contents: r#"# ADD IT AS `database`: `newgit resource add database --template postgres`.
+# Every variable this file publishes is named after the resource, so that
+# name makes them `DATABASE_URL` and `DATABASE_PORT`, which is what Rails,
+# Prisma, Django, Laravel and most other frameworks read already. Under any
+# other name they are `<NAME>_URL` and `<NAME>_PORT`, which no app reads
+# until you point it at them.
+#
+# THE ONE THING TO ADD: `/.postgres/` in the project's .gitignore, committed.
+# The cluster's files are in the workspace, and a file Git does not ignore
+# would be captured into every checkpoint as source. `prepare` refuses until
+# it is ignored rather than doing that quietly.
+#
+# HOST TOOLS: `initdb`, `postgres`, `pg_ctl`, `pg_isready`, `pg_dumpall` and
+# `psql`, all from one Postgres install (`brew install postgresql@17`, apt's
+# `postgresql`). Debian and Ubuntu put the server programs (`initdb`,
+# `postgres`, `pg_ctl`) in /usr/lib/postgresql/<version>/bin, which is not
+# on PATH; add it. Nothing here needs Docker, a running Postgres, or root.
+#
+# Each instance gets a whole cluster of its own: its own `postgres` process,
+# on its own port, over its own data directory in the workspace. Nothing is
+# shared, so a migration, a `drop database` or a full disk on one branch
+# cannot reach another, and every database the app creates in the cluster
+# is the branch's. Contrast `command-snapshot`, which makes one database per
+# instance inside a server everybody shares: lighter, but every instance
+# shares that server's roles, extensions, settings and uptime, and it is the
+# server's owner, not newgit, who decides what cleanup may touch.
+#
+# The cluster lives and dies with the workspace, which is what
+# `ownership = "workspace"` says: `newgit remove` dumps it into the
+# checkpoint it takes first and deletes it with the tree, refusing when the
+# dump fails (a stopped server: `newgit start` it first) unless `--force`,
+# and `undo` puts it back from the last dump. `newgit stop --evict` refuses
+# while it is there, since an ignored file no tracker owns is not something
+# eviction brings back. `--discard-ignored` evicts anyway and the cluster is
+# gone; the dump in the checkpoint the eviction took is what is left of it.
+ownership = "workspace"
+depends_on = []
+
+# In a monorepo, uncomment to run everything from one package. `.postgres`
+# below is relative to it, and so is the line in .gitignore.
+# workdir = "packages/api"
+
+[ports]
+# 5433, not 5432: a host Postgres that happens to be down when an instance
+# spawns would otherwise lose its port to that instance.
+db = { start = 5433, env = "RESOURCE_PORT" }
+
+[exports]
+# Trust auth on 127.0.0.1, as a Homebrew install has: anyone with a shell on
+# this machine can connect, the same as to every other dev server here.
+RESOURCE_URL = "postgresql://postgres@127.0.0.1:{{ports.db}}/postgres"
+
+[actions.prepare]
+# A cluster that is already there is kept: `prepare` runs again for a
+# resource a `tracker use` brings back, and must not wipe its data.
+command = '''
+git check-ignore -q .postgres/data || { echo ".postgres/ is not gitignored: add /.postgres/ to .gitignore and commit it, or the cluster's files are captured into every checkpoint" >&2; exit 1; }
+test -f .postgres/data/PG_VERSION || initdb -D .postgres/data -U postgres --auth=trust --encoding=UTF8 --locale=C --no-instructions
+'''
+
+[actions.start]
+# The server is a process newgit supervises, like a dev server: `newgit
+# status` sees it die, `newgit stop` and `start` take it down and back, and
+# its log is `newgit`'s. TCP only: with no `unix_socket_directories` the
+# server would put its socket where its build says, which on Debian is
+# /var/run/postgresql, writable only by root.
+command = "exec postgres -D .postgres/data -p {{ports.db}} -c listen_addresses=127.0.0.1 -c unix_socket_directories=''"
+long_running = true
+autostart = true
+
+# SIGINT is Postgres's fast shutdown: it disconnects clients and stops
+# cleanly. The default SIGTERM waits for every client to leave, and one psql
+# left open in a terminal would hold the stop forever.
+[actions.stop]
+signal = "int"
+
+# Up is accepting connections, not merely bound: Postgres listens before it
+# has finished recovery. `pg_isready` makes no query, so it is cheap enough
+# to run on every `newgit status`.
+[ready]
+command = "pg_isready -q -h 127.0.0.1 -p {{ports.db}} -U postgres"
+timeout_seconds = 30
+
+[checkpoint]
+mode = "command"
+# The whole cluster, so a database the app made (`rails db:create`,
+# `createdb test`) comes back too, roles included. `--restrict-key=newgit`
+# keeps the dump byte-identical for the same state; `command-snapshot`'s
+# checkpoint explains why, and what a fixed key gives up. Drop the flag on a
+# pg_dumpall older than 17.6, 16.10, 15.14 or 14.19, which rejects it and
+# needs none.
+command = "pg_dumpall --restrict-key=newgit -h 127.0.0.1 -p {{ports.db}} -U postgres > {{snapshot.path}}/cluster.sql && echo {{snapshot.path}}/cluster.sql"
+into_tracker = "db-snapshots"
+
+[restore]
+mode = "command"
+# `undo` stops the server before restoring and starts it after, so this runs
+# with the port free. It builds a fresh cluster beside the live one, loads
+# the dump into it on the same port, and only then swaps it in: a load that
+# fails leaves the cluster as it was. A fresh cluster has nothing to collide
+# with, so the dump loads whole, schema and data, with ON_ERROR_STOP. The one
+# line taken out is the `CREATE ROLE postgres` every pg_dumpall writes, since
+# `initdb` already made that role and creating it again is an error.
+command = '''
+set -e
+rm -rf .postgres/restoring .postgres/restore.log
+initdb -D .postgres/restoring -U postgres --auth=trust --encoding=UTF8 --locale=C --no-instructions >/dev/null
+pg_ctl -D .postgres/restoring -l .postgres/restore.log -w -o "-p {{ports.db}} -c listen_addresses=127.0.0.1 -c unix_socket_directories=''" start >/dev/null
+if ! grep -vx 'CREATE ROLE postgres;' "{{state_ref}}" | psql -X --quiet -v ON_ERROR_STOP=1 -h 127.0.0.1 -p {{ports.db}} -U postgres -d postgres >/dev/null; then
+  pg_ctl -D .postgres/restoring -w -m fast stop >/dev/null
+  exit 1
+fi
+pg_ctl -D .postgres/restoring -w -m fast stop >/dev/null
+rm -rf .postgres/data
+mv .postgres/restoring .postgres/data
+'''
+
+[cleanup]
+# Nothing to run: the server is newgit's process, stopped before teardown,
+# and its data is in the workspace, deleted with it. A `tracker drop` that
+# parks this resource stops the server and keeps the data for the next
+# `use`.
+"#,
+    },
+    ResourceTemplate {
         name: "command-snapshot",
         description: "a daemon-owned database captured through the daemon into a tracker",
         companions: &[],
@@ -202,15 +352,20 @@ action = "prepare"
             audience: "project-devs",
             merge_with_source: false,
         }],
-        contents: r#"ownership = "branch"
+        contents: r#"# ADD IT AS `database` (`newgit resource add database --template
+# command-snapshot`) and the export below is `DATABASE_URL`, which most
+# frameworks read already: every variable is named after the resource.
+ownership = "branch"
 
-# HOST TOOLS: `createdb`, `dropdb`, `pg_dump` and `psql` on your PATH,
-# pointed at a Postgres running on the host. If your database lives in a
+# HOST TOOLS: `createdb`, `dropdb`, `pg_dump`, `psql` and `pg_isready` on
+# your PATH, pointed at a Postgres running on the host. If your database lives in a
 # container a tool manages (Docker Compose, the Supabase CLI), you have none
 # of these against that database and the commands below will not work as
 # written — this template is ready to adapt *if your database is on the
-# host*. For Supabase specifically there is a `supabase` template that goes
-# through the CLI and `docker exec` instead.
+# host*. For Compose there is a `compose` template and for Supabase a
+# `supabase` one, which go through `docker compose exec` and the CLI. To
+# give each instance a server of its own rather than a database in a shared
+# one, use `postgres`.
 #
 # A branch-local database, named after the instance so instances never share
 # one. Edit the commands for your database; the shape is what matters:
@@ -227,8 +382,17 @@ action = "prepare"
 # bending this one; the two are different strategies, not variations on one
 # command.
 
+# Connect if the database is there, create it if not. Not `createdb ||
+# true`: that also swallows a server that is down, and the spawn would
+# report a database that does not exist as ready.
 [actions.prepare]
-command = "createdb {{branch.slug}} || true"
+command = "psql -Xq -d {{branch.slug}} -c 'select 1' >/dev/null 2>&1 || createdb {{branch.slug}}"
+
+# The server is shared and not newgit's to start, so up means it answers.
+# Without this the resource reads `ready` whenever its `prepare` once
+# passed, server running or not.
+[ready]
+command = "pg_isready -q -d {{branch.slug}}"
 
 # A convenience command, not a lifecycle hook: no stage runs `migrate`, and
 # nothing but you ever will — `newgit action <this resource>.migrate`. Only
@@ -254,12 +418,19 @@ into_tracker = "db-snapshots"
 
 [restore]
 mode = "command"
-command = "dropdb {{branch.slug}} --if-exists && createdb {{branch.slug}} && psql --quiet {{branch.slug}} < {{state_ref}}"
+# `--force` ends the sessions still open on this instance's database (a
+# psql left in a terminal), which would otherwise make the drop fail.
+# ON_ERROR_STOP makes a load that breaks halfway fail the restore instead of
+# reporting success over half a database.
+command = "dropdb --force --if-exists {{branch.slug}} && createdb {{branch.slug}} && psql -X --quiet -v ON_ERROR_STOP=1 -d {{branch.slug}} < {{state_ref}}"
 
 [cleanup]
 command = "dropdb {{branch.slug}} --if-exists"
 
 [exports]
+# The commands above reach the server through libpq's defaults (`PGHOST`,
+# `PGPORT`, `PGUSER`); this URL has to name the same one. Edit it if yours
+# is not on localhost's default port.
 RESOURCE_URL = "postgres://localhost/{{branch.slug}}"
 "#,
     },
@@ -274,17 +445,21 @@ RESOURCE_URL = "postgres://localhost/{{branch.slug}}"
             audience: "project-devs",
             merge_with_source: false,
         }],
-        contents: r#"ownership = "branch"
+        contents: r#"# ADD IT AS `database` (`newgit resource add database --template
+# command-snapshot-migrations`) and the export below is `DATABASE_URL`, which
+# most frameworks read already: every variable is named after the resource.
+ownership = "branch"
 
-# HOST TOOLS: `createdb`, `dropdb`, `pg_dump` and `psql` on your PATH,
-# pointed at a Postgres running on the host. Note what that excludes: this
-# template names Rails, Prisma and Supabase as its audience below, and a
-# Supabase user — or a Prisma user on Docker Compose, which is most of them
-# — has none of these binaries against the database, because it lives in a
-# container the tool manages. This is ready to adapt *if your database is on
-# the host*. If it is Supabase, start from the `supabase` template instead,
-# which goes through the CLI and `docker exec`; if it is Compose, the shape
-# below is still right and every command needs a `docker exec` in front.
+# HOST TOOLS: `createdb`, `dropdb`, `pg_dump`, `psql` and `pg_isready` on
+# your PATH, pointed at a Postgres running on the host. Note what that
+# excludes: this template names Rails, Prisma and Supabase as its audience
+# below, and a Supabase user — or a Prisma user on Docker Compose, which is
+# most of them — has none of these binaries against the database, because
+# it lives in a container the tool manages. This is ready to adapt *if your
+# database is on the host*. If it is Supabase, start from the `supabase`
+# template instead, which goes through the CLI and `docker exec`; if it is
+# Compose, start from `compose`, whose commands go through `docker compose
+# exec`.
 #
 # For a database whose schema comes from migrations, not from the dump —
 # Rails, Prisma, Supabase, and anything else that runs `migrate` to build
@@ -305,8 +480,17 @@ RESOURCE_URL = "postgres://localhost/{{branch.slug}}"
 # migrate reset --force`, `supabase db reset`, ...) and the `where` clause
 # below for whichever schemas your dump actually covers.
 
+# Connect if the database is there, create it if not. Not `createdb ||
+# true`: that also swallows a server that is down, and the spawn would
+# report a database that does not exist as ready.
 [actions.prepare]
-command = "createdb {{branch.slug}} || true"
+command = "psql -Xq -d {{branch.slug}} -c 'select 1' >/dev/null 2>&1 || createdb {{branch.slug}}"
+
+# The server is shared and not newgit's to start, so up means it answers.
+# Without this the resource reads `ready` whenever its `prepare` once
+# passed, server running or not.
+[ready]
+command = "pg_isready -q -d {{branch.slug}}"
 
 [actions.reset]
 command = "npm run db:migrate:reset"
@@ -322,7 +506,7 @@ into_tracker = "db-snapshots"
 [restore]
 mode = "command"
 command = """
-npm run db:migrate:reset && psql --quiet {{branch.slug}} <<'SQL' && psql --quiet {{branch.slug}} < {{state_ref}}
+npm run db:migrate:reset && psql -X --quiet -v ON_ERROR_STOP=1 -d {{branch.slug}} <<'SQL' && psql -X --quiet -v ON_ERROR_STOP=1 -d {{branch.slug}} < {{state_ref}}
 do $$
 declare t record;
 begin
@@ -341,7 +525,139 @@ SQL
 command = "dropdb {{branch.slug}} --if-exists"
 
 [exports]
+# The commands above reach the server through libpq's defaults (`PGHOST`,
+# `PGPORT`, `PGUSER`); this URL has to name the same one. Edit it if yours
+# is not on localhost's default port.
 RESOURCE_URL = "postgres://localhost/{{branch.slug}}"
+"#,
+    },
+    ResourceTemplate {
+        name: "compose",
+        description: "a Docker Compose project per instance, worked for a Postgres `db` service; add it as `database`",
+        companions: &[],
+        // Same lane as the other database templates: a lane is per
+        // database, not per template.
+        companion_trackers: &[CompanionTracker {
+            name: "db-snapshots",
+            audience: "project-devs",
+            merge_with_source: false,
+        }],
+        contents: r#"# ADD IT AS `database`: `newgit resource add database --template compose`.
+# Every variable this file publishes is named after the resource, so that
+# name makes them `DATABASE_URL` and `DATABASE_PORT`, which is what most
+# frameworks read already. Under any other name they are `<NAME>_URL` and
+# `<NAME>_PORT`, which no app reads until you point it at them.
+#
+# HOST TOOLS: `docker` with the Compose plugin (`docker compose`), and a
+# daemon running. Nothing here needs a Postgres client on the host: every
+# database command runs inside the service, through `docker compose exec`.
+#
+# Each instance is a Compose project of its own: its own containers, its own
+# named volumes, its own published ports. Compose keeps projects apart by
+# name, and `COMPOSE_PROJECT_NAME` below gives each instance one. It is a
+# variable Compose itself reads, so every `docker compose` run through
+# `newgit run` (`logs`, `ps`, `exec`) reaches this instance's stack with no
+# `-p`. One project has one such name, so a second resource from this
+# template in the same project would claim it twice and the graph refuses;
+# put every service in the one Compose project instead.
+#
+# TWO EDITS, both load-bearing:
+#
+# 1. `EDIT_ME_PROJECT` below becomes your project's name, lowercase. The
+#    instance name alone is not unique on this machine: two projects with a
+#    `feature-a` would share one stack. Left as it is, Compose refuses it
+#    (uppercase), which is the failure you want.
+#
+# 2. Your compose file publishes the port from `DATABASE_PORT`, with your
+#    current port as the default, so a clone without newgit still works:
+#
+#      services:
+#        db:
+#          image: postgres:17
+#          environment:
+#            POSTGRES_PASSWORD: postgres
+#            POSTGRES_DB: app
+#          ports:
+#            - "127.0.0.1:${DATABASE_PORT:-5432}:5432"
+#          volumes:
+#            - db-data:/var/lib/postgresql/data
+#      volumes:
+#        db-data:
+#
+#    A fixed `"5432:5432"` publishes every instance on one port, and the
+#    second instance's `up` fails to bind it. Another service with a port
+#    gets a lane of its own in `[ports]`, the same way.
+#
+# THERE IS NO GENERIC CHECKPOINT FOR COMPOSE. A stack is whatever services
+# you wrote, and their state is in volumes newgit cannot read consistently
+# while they run: a copy of a live database's files is not a snapshot of the
+# database. So `[checkpoint]` and `[restore]` below go through the service's
+# own dump tool, and are written for a Postgres service named `db` holding a
+# database named `app`. For another database, change those three things to
+# its tool (`mysqldump` and `mysql` for MySQL). For a stack with no state
+# worth rewinding (a cache, a mail catcher), set both to `mode = "none"`
+# and know that `undo` then leaves the stack exactly as it is.
+ownership = "branch"
+depends_on = []
+
+[ports]
+# 5433, not 5432: a host Postgres that happens to be down when an instance
+# spawns would otherwise lose its port to that instance.
+db = { start = 5433, env = "RESOURCE_PORT" }
+
+[exports]
+# EDIT ME: your project's name, lowercase.
+COMPOSE_PROJECT_NAME = "EDIT_ME_PROJECT-{{branch.slug}}"
+RESOURCE_URL = "postgresql://postgres:postgres@127.0.0.1:{{ports.db}}/app"
+
+[actions.prepare]
+# Exports are bound before `prepare` runs, so this brings up this
+# instance's project on this instance's ports. `--wait` returns once every
+# service is running, or healthy where it has a healthcheck.
+command = "docker compose up --detach --wait"
+
+# `newgit stop` and `newgit start`: the stack is not a process newgit
+# supervises, so these are how it comes down and back. `stop` keeps the
+# containers and volumes; `down` would not, and is `[cleanup]`.
+[actions.suspend]
+command = "docker compose stop"
+
+[actions.resume]
+command = "docker compose start"
+
+# Up is the database accepting connections, which a running container is
+# not yet. Over TCP (`-h 127.0.0.1`), not the socket: on a fresh volume the
+# official image first runs a server on the socket alone to create
+# `POSTGRES_DB`, then restarts it, and a check over the socket passes during
+# that first server and lets a query land in the restart. This runs on every
+# `newgit status`, and a `docker compose exec` costs a round trip to the
+# daemon (tens of milliseconds); a stack with an HTTP service can use `http
+# = "http://127.0.0.1:{{ports.web}}/health"` instead, which costs nothing.
+[ready]
+command = "docker compose exec -T db pg_isready -q -h 127.0.0.1 -U postgres"
+timeout_seconds = 60
+
+[checkpoint]
+mode = "command"
+# `--restrict-key=newgit` keeps the dump byte-identical for the same state;
+# `command-snapshot`'s checkpoint explains why, and what a fixed key gives
+# up. Drop it on an image older than Postgres 17.6, 16.10, 15.14 or 14.19,
+# whose pg_dump rejects it and needs none.
+command = "docker compose exec -T db pg_dump --restrict-key=newgit -U postgres app > {{snapshot.path}}/db.sql && echo {{snapshot.path}}/db.sql"
+into_tracker = "db-snapshots"
+
+[restore]
+mode = "command"
+# The stack keeps running through an `undo`, so the database is dropped
+# and made again under it, then loaded. `--force` ends sessions still open
+# on it; ON_ERROR_STOP makes a load that breaks halfway fail the restore.
+command = "docker compose exec -T db sh -c 'dropdb -U postgres --force --if-exists app && createdb -U postgres app' && docker compose exec -T db psql -X --quiet -v ON_ERROR_STOP=1 -U postgres -d app < {{state_ref}}"
+
+[cleanup]
+# The instance is going away, and so do its containers, network and named
+# volumes. A volume your compose file marks `external` is not the
+# project's, and `down` leaves it alone.
+command = "docker compose down --volumes --remove-orphans"
 "#,
     },
     ResourceTemplate {
@@ -470,6 +786,12 @@ replace = [
 # (only `--no-backup`, used in `cleanup`, deletes it), so the branch's data
 # comes back on the new ports. Its output and exit code are ignored: there is
 # nothing to stop on a first start.
+#
+# When a container is unhealthy, `supabase start` stops the whole stack
+# before it exits, so the log ends in empty `container logs:` sections. To
+# see why, start it by hand without the teardown, in this instance's
+# environment: `newgit run <instance> -- supabase start
+# --ignore-health-check`, then `docker logs <container>`.
 command = "supabase stop >/dev/null 2>&1; supabase start"
 
 # A convenience command, not a lifecycle hook: nothing runs this for you.
@@ -484,6 +806,17 @@ command = "supabase stop"
 
 [actions.resume]
 command = "supabase start"
+
+# Up is the API gateway answering, and Auth behind it. Without this the
+# stack reads `ready` whenever its `prepare` once passed, so one that has
+# since gone down (Docker quit, a container died) still looks up, and what
+# `depends_on` it starts against nothing. This GET goes through Kong to
+# Auth's health endpoint, which needs no API key, and costs one local HTTP
+# request, so it is cheap enough for every `newgit status`. Not `supabase
+# status`: that is a CLI run and several Docker API calls each time.
+[ready]
+http = "http://127.0.0.1:{{ports.api}}/auth/v1/health"
+timeout_seconds = 120
 
 [checkpoint]
 mode = "command"
@@ -529,9 +862,11 @@ mode = "command"
 #
 # A schema of your own that a migration or the seed writes rows into goes
 # in the list too. `ON_ERROR_STOP` stops the restore when a truncate
-# fails, instead of loading on top of what it could not empty.
+# fails, instead of loading on top of what it could not empty, and fails it
+# when the load breaks halfway, instead of reporting a half-loaded database
+# as restored.
 command = """
-supabase db reset && docker exec -i {{exports.RESOURCE_DB_CONTAINER}} psql --quiet -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL' && docker exec -i {{exports.RESOURCE_DB_CONTAINER}} psql --quiet -U postgres -d postgres < {{state_ref}}
+supabase db reset && docker exec -i {{exports.RESOURCE_DB_CONTAINER}} psql --quiet -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL' && docker exec -i {{exports.RESOURCE_DB_CONTAINER}} psql --quiet -v ON_ERROR_STOP=1 -U postgres -d postgres < {{state_ref}}
 do $$
 declare t record;
 begin
@@ -559,8 +894,9 @@ command = "supabase stop --no-backup"
         description: "a resource another system owns; newgit holds only a handle",
         companions: &[],
         companion_trackers: &[],
-        contents: r#"# HOST TOOLS: your provider's CLI. `cloudctl` below is a stand-in and is
-# not a real program — every command here is yours to write.
+        contents: r#"# HOST TOOLS: your provider's CLI. `EDIT_ME_CLI` below stands in for it
+# and is not a real program — every command here is yours to write, and
+# `newgit resource check` fails until none of them names it.
 ownership = "external"
 
 # newgit does not own this resource, so it never assumes deletion semantics
@@ -578,7 +914,7 @@ ownership = "external"
 
 [actions.prepare]
 # Edit to your provisioning command.
-command = "cloudctl preview create --branch {{branch.name}} --json"
+command = "EDIT_ME_CLI preview create --branch {{branch.name}} --json"
 captures = ["RESOURCE_ID", "RESOURCE_URL"]
 
 [checkpoint]
@@ -591,7 +927,7 @@ state_ref = "{{exports.RESOURCE_ID}}"
 mode = "external"
 
 [cleanup]
-command = "cloudctl preview delete {{state_ref}}"
+command = "EDIT_ME_CLI preview delete {{state_ref}}"
 "#,
     },
 ];

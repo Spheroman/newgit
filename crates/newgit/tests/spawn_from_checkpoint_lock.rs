@@ -31,6 +31,7 @@ command = "echo \"$NEWGIT_LOCKED\" > {seen}"
     let workspace = workspace_of(&fixture, "feature-a");
     fixture.ok(&workspace, &["checkpoint"]);
 
+    only_on_the_remote(&fixture, "feature-a");
     let store = newgit_core::MetadataStore::at(fixture.store.clone());
     let held = store.lock_instance("review", "review").expect("lock");
     let mut child = Command::new(env!("CARGO_BIN_EXE_newgit"))

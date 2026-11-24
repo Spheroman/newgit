@@ -96,8 +96,11 @@ newgit spawn --from-checkpoint auth-refactor/ckpt_003
 newgit merge auth-refactor
 ```
 
-The hosted remote at [newgit.dev](https://newgit.dev) is invite-only for now.
-The Worker in [`remote/`](https://github.com/Spheroman/newgit/tree/main/remote) lets you deploy your own.
+The hosted remote at [newgit.dev](https://newgit.dev) takes any GitHub
+account, with up to 5 projects each, and pauses while it is over its weekly
+budget. [`newgit serve`](docs/wiki/serve.md) runs your own on one machine, and
+the Worker in [`remote/`](https://github.com/Spheroman/newgit/tree/main/remote)
+deploys one to Cloudflare.
 
 ## Built for T3 Code
 
@@ -138,7 +141,7 @@ curl -fsSL https://newgit.dev/install.sh | sh
 ```
 
 The script picks the prebuilt binary for your OS and architecture, verifies
-its checksum, and puts it in `~/.local/bin`. Set `NEWGIT_VERSION=v0.10.0` to
+its checksum, and puts it in `~/.local/bin`. Set `NEWGIT_VERSION=v0.11.0` to
 pin a release or `NEWGIT_INSTALL_DIR` to put it elsewhere.
 
 Or with Homebrew, on macOS or Linux:

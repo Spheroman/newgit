@@ -2,15 +2,14 @@
 //!
 //! The API still names repos as the Worker did (`<owner>.<project>.t.<tracker>`,
 //! `.t.<tracker>.<login>`, `.i.<instance>.<tracker>`), so the CLI is unchanged.
-//! On disk they are laid out by home, so a project's state and repos are one
+//! On disk they are laid out by home, so a project's state and stores are one
 //! directory: `homes/<owner>/<project>/`. That directory is the unit a
 //! second node would take over.
 //!
-//! An instance's fork of a tracker is not a repo of its own: it is a Git
-//! namespace (`refs/namespaces/i/refs/namespaces/<instance>/`) inside the
-//! tracker's repo, so making one copies refs, not objects. A private
-//! instance's forks are the exception: separate repos, because a shared
-//! object store answers "do you have this?" for everyone in it.
+//! None of those repos is a repository of its own: each is a Git namespace
+//! in its audience's store (`crate::repos`). A tracker is `t/<tracker>`; an
+//! instance's fork of it is `t/<tracker>/i/<instance>`, inside it, so making
+//! one copies refs, not objects.
 
 use camino::{Utf8Path, Utf8PathBuf};
 
@@ -27,7 +26,7 @@ impl ProjectId {
         format!("{}/{}", self.owner, self.name)
     }
 
-    /// The project's directory: its repos.
+    /// The project's home: its stores.
     pub fn dir(&self, data: &Utf8Path) -> Utf8PathBuf {
         data.join("homes").join(&self.owner).join(&self.name)
     }
@@ -146,68 +145,23 @@ pub fn repo_from_url_or_name(value: &str) -> &str {
     last.strip_suffix(".git").unwrap_or(last)
 }
 
-/// Where Git finds a repo: its directory, and for a fork the namespace in it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Location {
-    pub git_dir: Utf8PathBuf,
-    pub namespace: Option<String>,
+/// The namespace a tracker's history is, in its audience's store.
+pub fn tracker_namespace(tracker: &str) -> String {
+    format!("t/{tracker}")
 }
 
-/// A tracker's own repo on disk.
-pub fn tracker_dir(data: &Utf8Path, project: &ProjectId, tracker: &str) -> Utf8PathBuf {
-    project.dir(data).join("t").join(format!("{tracker}.git"))
+/// The namespace one user's content of a per-user tracker is, in that
+/// user's store. Not `t/`: a tracker later defined for `user:<login>` would
+/// otherwise land on top of it.
+pub fn user_namespace(tracker: &str) -> String {
+    format!("u/{tracker}")
 }
 
-/// Where `repo` is. `private` says whether a fork's instance is private: its
-/// forks are repos of their own.
-pub fn locate(data: &Utf8Path, repo: &RepoRef, private: bool) -> Location {
-    match repo {
-        RepoRef::Tracker {
-            project,
-            tracker,
-            login: None,
-        } => Location {
-            git_dir: tracker_dir(data, project, tracker),
-            namespace: None,
-        },
-        RepoRef::Tracker {
-            project,
-            tracker,
-            login: Some(login),
-        } => Location {
-            git_dir: project
-                .dir(data)
-                .join("u")
-                .join(tracker)
-                .join(format!("{login}.git")),
-            namespace: None,
-        },
-        RepoRef::Fork {
-            project,
-            instance,
-            tracker,
-        } if private => Location {
-            git_dir: project
-                .dir(data)
-                .join("i")
-                .join(instance)
-                .join(format!("{tracker}.git")),
-            namespace: None,
-        },
-        RepoRef::Fork {
-            project,
-            instance,
-            tracker,
-        } => Location {
-            git_dir: tracker_dir(data, project, tracker),
-            namespace: Some(fork_namespace(instance)),
-        },
-    }
-}
-
-/// The Git namespace an instance's forks live in, inside each tracker's repo.
-pub fn fork_namespace(instance: &str) -> String {
-    format!("i/{instance}")
+/// The namespace an instance's fork of a tracker is: inside the tracker's
+/// own, so it moves with it, and for a private instance in that instance's
+/// store instead.
+pub fn fork_namespace(tracker: &str, instance: &str) -> String {
+    format!("t/{tracker}/i/{instance}")
 }
 
 /// Where `namespace`'s refs are stored, as Git lays them out.
@@ -288,19 +242,16 @@ mod tests {
     }
 
     #[test]
-    fn forks_are_namespaces_unless_private() {
-        let data = Utf8Path::new("/d");
-        let fork = parse_repo_name("jack.newgit.i.fix.root").expect("a fork");
-        let shared = locate(data, &fork, false);
-        assert_eq!(shared.git_dir, "/d/homes/jack/newgit/t/root.git");
-        assert_eq!(shared.namespace.as_deref(), Some("i/fix"));
+    fn repos_are_nested_namespaces() {
         assert_eq!(
-            namespace_prefix("i/fix"),
-            "refs/namespaces/i/refs/namespaces/fix/"
+            namespace_prefix(&fork_namespace("root", "fix")),
+            "refs/namespaces/t/refs/namespaces/root/refs/namespaces/i/refs/namespaces/fix/"
         );
-        let private = locate(data, &fork, true);
-        assert_eq!(private.git_dir, "/d/homes/jack/newgit/i/fix/root.git");
-        assert_eq!(private.namespace, None);
+        assert!(
+            namespace_prefix(&fork_namespace("root", "fix"))
+                .starts_with(&namespace_prefix(&tracker_namespace("root")))
+        );
+        assert_ne!(user_namespace("env"), tracker_namespace("env"));
     }
 
     #[test]

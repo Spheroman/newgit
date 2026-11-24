@@ -41,7 +41,11 @@ anything.
 
 > **2026-11-09:** [`newgit serve`](serve.md) answers this same API as one
 > binary, with repos on local disk and state in SQLite, and is several times
-> faster. What follows is the Worker, which still runs newgit.dev.
+> faster. What follows is the Worker, which still runs newgit.dev. Since
+> #414 `serve` also has the GitHub webhook and exports to mirrors itself,
+> differently in two ways said below (*The GitHub webhook*): whose work a
+> mirror's commit is is read from its content, and the export is the
+> server's own job, not the client's (serve.md, decision 11).
 
 Deployed at `newgit.dev`: the Worker (`remote/`, TypeScript), its Durable
 Objects, the Git endpoint's container, and Artifacts.
@@ -290,6 +294,23 @@ Identity is the GitHub login (`newgit login`, GitHub's device flow, like
 which only the project's owner may run, and only from their login (an
 agent's or instance's token is refused). The creator is the first member
 and cannot be removed.
+
+This list is also who an encrypted tracker is encrypted to (#338): clients
+encrypt to the members it names, by the keys GitHub publishes for them. So
+the remote is the membership authority for encryption too. It cannot read
+encrypted content, but it could add a login whose keys would then become
+recipients of the next capture, which is why clients print every recipient
+by key fingerprint whenever the set changes. It also serves the tracker
+definitions (through `access`), and a definition decides whether a path is
+encrypted at all: one turned `public`, or into a tracker in Git, or a new
+`public` tracker over an encrypted path, would have the next capture stored
+in plaintext. Clients hold that back only where they can tell: a machine
+that has held a path's encrypted content refuses to capture or send it
+unencrypted until `newgit tracker allow-plaintext <path>` is run there (a
+confirmation, which an agent in the workspace can give too, not a
+boundary; it knows paths, so the same content copied or moved to another
+path is not held back), and a machine that never held it has nothing to
+compare against.
 
 **Who may use it (decided).** Who may use a remote at all is the Worker's
 `ALLOWED_LOGINS` secret: GitHub logins separated by commas or whitespace, or
@@ -822,7 +843,10 @@ the remote still drops. Each band costs the remote about a minute however
 small it is, so the bands are wide. One stepped fetch runs in a store at a
 time, since two deepening at once fail with `shallow file has changed since
 we read it`; the second waits, then carries on only if the store still needs
-it.
+it. Git itself rewrites `shallow` too: the `git repack` its auto-maintenance
+detaches after a fetch prunes it. So the bands skip auto-maintenance, and a
+fetch that meets another Git rewriting `shallow` (that error, or
+`shallow.lock` taken) waits and fetches again.
 
 Who may move a tracker is its definition's `maintainers` (`owner`,
 `project-devs`, or `user:<login>`; it defaults to the audience). A
@@ -857,6 +881,13 @@ Undo stays as it is in v1, local only.
 ---
 
 ## The GitHub webhook
+
+> On `newgit serve` (serve.md, decision 11) the same event lands through
+> the server's own merge, with a secret per project from `--github`; whose
+> withheld work a commit carries is read from the commits themselves (each
+> instance holding such work composed as the target sees it), not from the
+> branch GitHub names, which refused three good pulls on newgit.dev (#451).
+> What follows is the Worker.
 
 A pull request merged on a mirror lands in `main` on newgit.dev by itself.
 GitHub pushes an event to `POST /v1/webhooks/github?project=<owner>/<name>`,

@@ -21,11 +21,12 @@ newgit export auth-refactor --to ../public-export
 newgit cleanup
 ```
 
-With a remote (the hosted one, `https://newgit.dev`, is invite-only for
-now; the Worker in `remote/` deploys your own), the same checkpoint
-travels: a teammate, or a cloud agent's checkpoint, comes up on your machine
-with its source, uncommitted work, your own copy of its trackers, and its
-resources restored.
+With a remote, the same checkpoint travels: a teammate's, or a cloud
+agent's, comes up on your machine with its source, uncommitted work, your
+own copy of its trackers, and its resources restored. The hosted one,
+`https://newgit.dev`, lets in any GitHub account, with up to 5 projects
+each, and pauses for everyone while it is over its weekly budget;
+[`newgit serve`](serve.md) runs your own.
 
 ```sh
 newgit login                      # GitHub device flow

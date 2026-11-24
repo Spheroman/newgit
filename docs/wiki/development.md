@@ -26,8 +26,13 @@ it locally.
   materialization, checkpoints and undo, export, cleanup, and the remote
   client.
 - `crates/newgit` is the CLI, published as the `newgit` crate.
+- `crates/newgit-serve` is `newgit serve`: the remote as one process, with
+  Git repositories on disk and project state in SQLite.
 - `remote/` is the hosted remote: a Cloudflare Worker with Durable Objects
-  over Artifacts repos, deployed at `https://newgit.dev`.
+  over Artifacts repos, deployed at `https://newgit.dev`. Try a change to it
+  on the dev remote before it merges: `remote/scripts/dev.sh` deploys the
+  working tree there (`--build` builds the container too, with Docker), and
+  `remote/scripts/dev-login.sh` logs in to it without a browser.
 - `.newgit/` is created by `newgit init`. Committed: `config.toml`,
   `trackers/`, `resources/`, `scripts/`. Gitignored local state: `branches/`,
   `checkpoints/`, `logs/`, `state/`, `installs/`, and `local/` — which holds

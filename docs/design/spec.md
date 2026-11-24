@@ -99,7 +99,11 @@ Resources exist for exactly three reasons:
   build) are tied to a machine and a path. The truth is the identity, the
   lockfile, and the artifact is derived from it. Instances whose identity
   agrees can share the derived tree through the install store (see
-  *Installs*); instances whose identity differs never do.
+  *Installs*); instances whose identity differs never do. Build output a
+  tool refills on its own (`target/`, `.next/cache`) is the same kind of
+  state with the rebuild left to the tool: a resource declares it
+  `disposable`, with no hook at all, and an eviction drops it (see
+  *Stop, start, evict*).
 
 If something is just files that copy correctly, it is a tracker.
 
@@ -123,10 +127,10 @@ The test of the design:
 > Can a user model a tracker or resource the newgit authors did not
 > anticipate?
 
-The starter templates (`process`, `pnpm`, `install`, `command-snapshot`,
-`command-snapshot-migrations`, `supabase`, `external`) are definitions like
-any other, written to `.newgit/resources/` and owned by the project from
-then on. Each states the host tools it assumes, since "ready to adapt" and
+The starter templates (`process`, `pnpm`, `install`, `postgres`,
+`command-snapshot`, `command-snapshot-migrations`, `compose`, `supabase`,
+`external`) are definitions like any other, written to
+`.newgit/resources/` and owned by the project from then on. Each states the host tools it assumes, since "ready to adapt" and
 "ready to adapt if your database runs on the host" are different claims. A
 template may bring the companions it needs, such as the `pnpm-store`
 resource it depends on or the `db-snapshots` tracker its checkpoint
@@ -142,6 +146,20 @@ that `[[render]] path` changes with it). A render `find` that matches 0 times
 often means the file lacks that setting, so the tool uses its own default and
 every instance shares it; the error says so, and the fix is to add the line,
 not to delete the rule.
+
+Four templates give a branch its own database, and they differ in what the
+instance owns. `postgres` gives each instance a whole cluster: a supervised
+`postgres` process on a claimed port over a data directory in the workspace
+(`ownership = "workspace"`), so nothing is shared and teardown is the
+workspace going away. `compose` gives each instance its own Compose project
+(`COMPOSE_PROJECT_NAME`), with suspend and resume as `stop` and `start` and
+cleanup as `down --volumes`. `command-snapshot` and
+`command-snapshot-migrations` make a database per instance inside one
+server everybody shares, which is lighter but shares that server's roles,
+settings and uptime. There is no generic checkpoint for Compose: a stack's
+state is in volumes that cannot be copied consistently while it runs, so
+`compose` checkpoints through the database service's own dump tool and
+says so. Each is added as `database`, so its export is `DATABASE_URL`.
 
 ### Committed definitions, local state
 
@@ -243,7 +261,14 @@ The full model is in [`trackers.md`](trackers.md). The short version:
 
 - **Every path has at most one owner.** A tracker is *mounted* at a path
   inside its parent, and claims paths relative to its mount (`!` excludes).
-  The deepest mount wins, then the longest claim. `root` owns `.`,
+  The longest claim that reaches a path owns it. A claim reaches a path
+  under it unless a tracker mounted deeper holds the path and the claim is
+  `.`, or a directory around that mount, or the claiming tracker is in Git.
+  So only a tracker outside Git reaches into another's mount, with a claim
+  inside it: `paths = ["apps/t3code/.env"]` owns that file just as `mount =
+  "apps/t3code"`, `paths = [".env"]` would. A tracker's own `!`
+  exclusions take it out of the running; identical claims are an error,
+  except between role alternatives. `root` owns `.`,
   everything nothing else claims, `.newgit/` included. `access` is mounted
   at `.newgit/trackers/` and holds every tracker's definition, which decides
   who may read what; by default only the project's owner may change it
@@ -261,8 +286,12 @@ The full model is in [`trackers.md`](trackers.md). The short version:
   so no id changes. You commit to a tracker in Git with Git. When work
   leaves the machine, newgit splits each commit into one root commit and a
   commit in each tracker it changed, and composing them back gives the same
-  commit, with the same id. `newgit pull <tracker>` moves a pin to the
-  tracker's `follow` ref; nothing else moves one on your behalf.
+  commit, with the same id. `newgit pull` moves every pin that is
+  behind, at any depth, to the tracker's `follow` ref, after taking what is
+  new on its export target when it has one rooted at it, in one commit on
+  the branch it runs on (a child's moves by a commit in its parent first);
+  `newgit pull t3code ui-kit` only those. No tracker's `main` moves until
+  `newgit merge`, and nothing else moves a pin on your behalf.
 - **A tracker outside Git** (`git = false`, the default) owns files that
   never belong in Git: an `.env.local`, an agent's notes, a SQLite file, a
   public page. They are captured by newgit, never committed.
@@ -273,6 +302,17 @@ The full model is in [`trackers.md`](trackers.md). The short version:
   A negative priority is never bound unless asked. `newgit tracker use` and
   `drop` change a live instance's binding. A tracker brings resources, and
   they run only while it is bound.
+- **Members of a role are forks of each other.** `newgit tracker create
+  staging-db --role db --from local-db` starts a tracker outside Git at
+  `local-db`'s `main` (two refs in the one local store, nothing copied) and
+  records `from = "local-db"`, so the two share history and can merge
+  (merging between members is next). A fork's audience is a ceiling: never
+  wider than its upstream's, even after `from` is dropped or changed. The
+  client refuses a wider one at creation, on every load, and in any commit
+  changing definitions; `newgit serve` records what each fork's repo was made
+  from and serves a wider one with its upstream's audience. Against
+  newgit.dev's Worker only the client checks it. A fork is never detached. A
+  tracker in Git cannot be forked yet.
 
 ### Trackers outside Git
 
@@ -362,6 +402,71 @@ your own `.env.local`, never theirs. `tracker create --storage remote`
 is refused until the project has a remote, rather than quietly behaving as
 local.
 
+**A synced tracker outside Git is encrypted to its audience (#338).** With
+`storage = "remote"` and an audience other than `public` (no opt-out: what a
+server must read, like newgit.dev's `site`, is `public`), each file is
+encrypted whole with age on this machine before anything is sent. The
+recipients are computed, never read back: the members the audience names, as
+the remote lists them now (the remote is the membership authority), by the
+`ssh-ed25519` and `ssh-rsa` keys GitHub publishes for each. The ciphertext is
+an ordinary blob in the tracker's history, so Git's object model is
+untouched; the list is written beside it at `.newgit/recipients` for people
+to read, and no code takes a recipient from it. Capture encrypts (reusing a
+parent's blob when its content is unchanged and its own age header names
+the current keys, exactly, so unchanged content is still no commit),
+projection decrypts with the developer's own SSH key (or `$NEWGIT_IDENTITY`),
+and the workspace holds plaintext, owner-only. Before a checkpoint syncs or
+`tracker merge` or `members add`/`remove` publishes, the member list is read
+again and every commit the remote does not have yet is checked against it:
+those encrypted to anyone else are made again, on the last commit the remote
+has, so nothing encrypted to a member removed since is ever sent. Every send
+checks that every file those commits carry is age ciphertext. A workspace
+path this machine has held encrypted content at is never captured or sent
+unencrypted because a definition (any definition, by any name) now puts it in
+a `public` tracker or a tracker in Git, until `newgit tracker allow-plaintext
+<path>` on this machine: a confirmation, keyed by path, not a boundary (the
+same content copied or moved to another path is not held back). What
+counts as already on the remote is kept per remote and project, and
+forgotten when the project is linked again. `user` is the login `newgit login` saved, never the remote's say. Publishing `main` fetches the
+remote's first and never forces over changes it lacks. Every change to the
+recipient set is printed by fingerprint. A tracker that was plaintext is
+encrypted on its next capture as a new history whose first commit names the
+plaintext rev it replaces; that is the one history replacement. Identities
+for sandboxes and cloud agents are #430. The reference's *Encrypted
+trackers* has the details.
+
+What it guarantees, and its limits:
+
+- The remote, and anyone who controls its deployment, cannot read what was
+  encrypted before it acts: this holds against a remote that only stores
+  and serves.
+- A remote that acts can read what is captured afterwards. It decides
+  membership, so it can add a login whose GitHub keys then become
+  recipients, and the only signal is the fingerprints newgit prints
+  (`CHANGED`, `+ <login>`). A machine encrypting a tracker for the first
+  time has nothing to compare with.
+- The remote also serves tracker definitions, and a definition decides
+  whether a path is encrypted at all. A machine that has held a path's
+  encrypted content (captured it encrypted, or decrypted it into a
+  workspace, as a fresh clone's spawn does) refuses, as an error, to
+  capture or send that path unencrypted, whatever tracker claims it now,
+  until `newgit tracker allow-plaintext <path>` is run there. A machine
+  that has never held the content has nothing to compare against and
+  captures as the definition says. It is a confirmation step, not a
+  boundary: an agent in the workspace can run `allow-plaintext` itself.
+  It knows paths, not content: the same content copied or moved to
+  another path is not held back.
+- GitHub accounts are the key authority.
+- There is no integrity: recipients' keys are public, so the remote can
+  replace a file with content of its choosing that decrypts cleanly (signed
+  tracker commits are [#431](https://github.com/Spheroman/newgit/issues/431)).
+- File names, sizes, link targets, commit messages, authors, and dates are
+  visible.
+- Revs pushed before a tracker was encrypted stay on the remote in
+  plaintext: rotate what they held.
+- A teammate on an older newgit sees ciphertext, and a capture of theirs
+  would push plaintext.
+
 `merge_with_source` is written to every definition but nothing reads it
 yet. `newgit merge` merges trackers in Git, and trackers outside Git move only
 through `tracker merge`. [`trackers.md`](trackers.md) plans to replace it
@@ -399,6 +504,11 @@ project repository:
 - The agent gets a fully real repository. `.git` is a directory, and `git
   fsck`, `git log`, and everything else check out.
 - Deleting a workspace is `rm -rf`. Nothing to register, prune, or lock.
+  The binding record outlives it, so `newgit start` makes it again: from
+  the instance's latest checkpoint, as an evicted one comes back, or from
+  its source branch with every resource prepared again when it has none.
+  Processes still running from the deleted directory are stopped first.
+  What was never checkpointed is gone, and `start` says so.
 - Nothing is shared between workspaces, so two instances of the same base
   branch is a non-event.
 
@@ -412,7 +522,15 @@ leaves trackers out is copied from a template of its own binding,
 `<workspace root>/.source-template-<key>`, sparse from before its first
 checkout: nothing it leaves out is written, so leaving files out makes a spawn
 faster, not slower. The same goes for a plain `git clone`, where there is no
-template. `newgit cleanup` removes a template no live binding uses. Then the copy
+template. On a remote, the template also fetches each export target's
+branch the workspace will get as `refs/remotes/<target>/<branch>` (a
+rooted target's is its tracker's whole history), under
+`refs/newgit-template/`. The copy drops those refs but keeps their
+objects, so the workspace's own fetch of that branch moves nothing; fetched
+into each workspace, t3code's was 17s of a 21s spawn.
+`newgit cleanup` removes a sparse template no live binding uses. The full
+one stays, even after the last instance is removed: it is a cache of the
+project's checkout, and the next spawn would only build it again. Then the copy
 gets its own branch, with the upstream `git clone --branch` would set, and
 `core.checkStat=minimal` plus `core.trustctime=false`. Without those two
 settings Git would re-hash every file on the first `git status`, because
@@ -554,8 +672,10 @@ something to newgit:
 - **`start` and `stop`** are a convention made real by `long_running =
   true`: the process starts detached in its own process group, its output
   goes to `.newgit/logs/`, its PID to `.newgit/state/`, and `stop` sends the
-  configured signal (TERM by default) to the group. No daemon, no restart
-  policy. `autostart = true` has `spawn` start it; the `process` template
+  configured signal (TERM by default) to the group. Its stdin is a pipe that
+  never delivers data or end-of-file while it runs, held by the wrapper
+  that waits on it (below), so a watcher that quits when stdin closes keeps
+  running. No daemon, no restart policy. `autostart = true` has `spawn` start it; the `process` template
   sets it.
 - **`suspend` and `resume`** take down and bring back something newgit does
   not supervise, such as a Supabase stack or a Compose project. `newgit
@@ -625,8 +745,15 @@ surprise found as a wrong variable in a subprocess.
 ### Ports
 
 **An instance's port never changes once allocated.** At bind time newgit
-takes the first port scanning up from the declared `start` that no other
-instance's record claims and that is free right now. "Free" means it binds
+takes the first of `start`, `start + 100`, `start + 200`, … that no other
+instance's record claims and that is free right now. Instances sit 100
+apart, not 1, because a claim holds nothing until the instance's server
+binds it and only newgit respects it: dev tools that pick an extra port by
+scanning up from a default (`remix dev`: 3001–3100) took the claims of
+instances packed one apart before those instances bound them. The stride
+keeps another instance's claim out of the ports just above each one; the
+real fix is the definition declaring and passing every port its tools
+open, which the reference tells agents to do. "Free" means it binds
 on all of 127.0.0.1, 0.0.0.0, ::1, and ::, with `SO_REUSEADDR` off, so a
 Docker container published on a wildcard address cannot hide behind a
 loopback-only check (#93).
@@ -637,17 +764,23 @@ the instance's record before its `prepare` runs, under a short lock held
 only while they are chosen, so two spawns installing side by side are never
 handed the same port.
 
-A record can only be as complete as the bind probe, and a container a
-resource starts can publish a port the record never learned about (#92).
-`newgit ports --check` catches that from the other side: it reads the real
-socket table (`lsof`), keeps listening ports inside some resource's range,
-and reports any that no record claims. It names an instance only when the
-instance's name or workspace really appears in the listener's command
-line. On macOS, Docker Desktop fronts container ports with its own proxy,
-so most Docker conflicts come back unattributed. An unattributed conflict is
-still the useful finding; a confidently wrong instance name would not be.
-If `lsof` is missing or fails, `--check` says it could not check rather
-than reporting every port free.
+A claimed port can still be taken, by another instance's tool or by any
+program. So whose a port is gets decided by the process listening on it,
+never by the claim: a listener belongs to an instance when it descends from
+a process newgit supervises for it, works inside its workspace, or names
+its workspace in its command line. `status` (and so the end of `spawn`,
+`start` and `rebind`) names the holder of a claimed port that is not the
+instance's own, with its pid, directory and instance, instead of leaving a
+bind failure in a log, and an instance whose port answers only because
+another instance's process holds it is not ready. `newgit ports --check`
+(#92) judges every claim the same way: ok when the claimant holds it or
+nothing does while its process is down, FAIL when anyone else does, and
+undecided for a resource newgit runs no process of, whose port Docker
+Desktop's proxy may hold for it. A port an instance's process listens on
+that nothing claims is a warning: the tool that will take somebody's claim.
+Unrelated listeners on the machine are not judged. If `lsof` is missing or
+fails, `--check` says it could not check rather than reporting every port
+free.
 
 ### Exports and the command environment
 
@@ -931,7 +1064,9 @@ What keeps sharing safe:
 - **A tree that names its own workspace is not shared**, unless a render
   covers the file. Copy-on-write cannot fix a path already baked into the
   content, so admission scans the tree and declines it, naming the file.
-  That resource keeps installing per instance. Nothing fails.
+  That resource keeps installing per instance. Nothing fails. Generated
+  code (a Prisma client) is moved into a resource of its own instead, keyed
+  on its own input.
 - **`prepare` is the only thing an entry stands in for.** A definition
   where something else builds the tree (a `long_running` or command-less
   `prepare`, `captures` it would stop publishing, a `recompute` restore
@@ -953,6 +1088,65 @@ per instance. The reference has the table, and the `pnpm` template ships a
 `user`-owned `pnpm-store` resource so newgit never touches the shared
 store.
 
+#### Every key gets an entry, and a miss costs disk only once (planned, #421)
+
+Two gaps in the store as built, and one rule that closes both: **every key
+an instance reaches gets an entry, and every entry shares what it can with
+the entries before it.**
+
+**A key that moves inside a live instance stores an entry.** Today an entry
+is published only when `prepare` finishes. An agent that runs `npm install
+zod` changes the lockfile and the tree, and the store never learns of it:
+the next instance at that lockfile runs a full `npm ci`. So a checkpoint
+whose instance has moved to a key the store has no entry for publishes the
+workspace's tree for it, through the same admission as any other entry.
+That tree is whatever the workspace holds, not a fresh `prepare`'s output,
+and that is the decision, made loudly: an instance that edited its
+`node_modules` by hand publishes the edit. The way back is the one that
+already exists: `newgit action <resource>.prepare` runs the command and
+replaces the entry, and `undo --force-recompute` drops it.
+
+**A miss is deduplicated against the store.** A miss still runs `prepare`
+in full, so `npm ci` stays `npm ci` and its output stays exactly what it
+would have been. What changes is what newgit keeps. Most of a new tree is
+byte-identical to an entry already in the store: a fresh `npm ci` of
+`remote/` matched the existing `node_modules` on 100% of its 290 MB at the
+same paths, apart from two binaries an install script swaps in. So after
+`prepare` finishes, and before the tree is published, newgit walks it, and
+every regular file whose relative path, size, and content hash match a file
+in another entry of the same resource is replaced by a copy-on-write clone
+of that file. The workspace and the new entry then share those blocks with
+every entry before them; only what actually changed takes new disk.
+
+- **Each entry carries a manifest** (path, size, hash) written when it is
+  published, so a dedup pass hashes only the new tree, never the store.
+  Candidates are found by path and size, and confirmed by hash.
+- **The replacement cannot change a byte.** On btrfs and XFS it is
+  `FIDEDUPERANGE`, which compares the ranges itself and shares them
+  atomically. APFS has no such call, so newgit clones the stored file
+  beside the target and renames it over, after checking that the target's
+  size and mtime still match what was hashed; a file that changed is
+  skipped. Hardlinked files (pnpm's) and symlinks are left alone.
+- **It never fails the bind.** It runs after `prepare` succeeded, and a file
+  it cannot replace is simply not shared. Where the filesystem cannot clone
+  at all, there is nothing to do, and newgit says so once.
+
+Together they make the store a set of independent entries, one per key,
+that share blocks as far back as their content agrees. There is no lineage
+to track: the filesystem counts references to each block, so dropping an
+old entry frees only what nothing else uses. Pruning stays what it is,
+entries no live instance keys to.
+
+**Build output is not an install, and this does not reach it.** Measured on
+this repository, a workspace's 5.6 GB `target/` is 2.0 GB of integration
+test executables, 2.2 GB of debug objects, 2.4 GB of `incremental/`, and
+about 0.3 GB of third-party crates. Two workspaces on the same toolchain
+share 5% of `target/debug/deps` byte for byte. The rest is the branch's
+own code compiled for that branch, which no store, clone, or dedup pass can
+share. Its disk comes back by removing instances whose work has landed (see
+*Cleanup*), and by building less of it per branch, which is the project's
+build configuration, not newgit's.
+
 ---
 
 ## An instance's life
@@ -967,19 +1161,36 @@ fill from the install store. Then it starts each long-running action marked
 `autostart`, dependencies first, so a dev server is up when the agent
 arrives. With a remote, it registers the instance there.
 
+What the project root has and the workspace does not is said, not copied:
+a gitignored file there named like a local secret (`.env.local`,
+`master.key`) that no tracker brought is named as left behind, with the
+three commands that make a tracker carry it (#83). Copying it would make
+the root's ignored files an undeclared, unversioned tracker; naming it
+turns a service failing hours later into a line at spawn.
+
 Autostart comes after every `prepare`, not interleaved with them, because
 `prepare` is a command that finishes and a dependent's `prepare` may need
 its dependency's files but never its process. A start that fails is
 reported per resource, and a dependent of a resource that did not start is
-not started against it. Starting is not waiting: the dependent starts once
-its dependency's process exists, not once that process answers (#54).
+not started against it. Starting is waiting (#54): a dependent starts once
+each dependency is up — its `[ready]` check passes, or with none every
+port its process claims answers — given that dependency's `[ready]
+timeout_seconds` (five by default), and not at all against a dependency
+whose `autostart` action is not running. A process that has been exec'd is not one that serves, and
+starting against it only moves the race into the dependent. One withheld
+this way stays owed: the next `newgit start` starts it, as it does an
+`autostart` action that died. `newgit action` of a long-running action by
+hand waits and refuses the same way.
 
-`spawn --from-checkpoint <instance>/<checkpoint>` brings up someone else's
-checkpoint, from the remote: their source and uncommitted work, the
-trackers you may read (your own copy of per-user ones), and resources
-restored from the checkpoint, such as a database loaded from its dump. It
-is built from parts that already exist: fetch, spawn at the checkpoint's
-head, then undo to the checkpoint. Its `autostart` actions start after the
+`spawn --from-checkpoint <instance>/<checkpoint>` brings up a checkpoint
+as a new instance: its source and uncommitted work, its trackers, and
+resources restored from the checkpoint, such as a database loaded from its
+dump. Like a bare branch name in Git, the name means this machine's first:
+a checkpoint taken here (even of an instance since removed) is used as it
+is, with no remote involved. Only one this machine does not have comes from
+the remote, which gives the trackers you may read and your own copy of
+per-user ones. It is built from parts that already exist: (fetch,) spawn at
+the checkpoint's head, then undo to the checkpoint. Its `autostart` actions start after the
 undo, since the restore stops and restarts processes to match the
 checkpoint. The new instance's workspace comes up on its own branch, made
 at the checkpoint's commit, even when the author's was on another branch
@@ -1011,11 +1222,56 @@ fix follows from what failed, and never names an action the resource does
 not define (#262). A failed render or export is fixed in the file or the
 definition, then bound again with `newgit resource rebind <resource>
 [instance]`, which binds it as spawn did (ports, exports, render, `prepare`,
-then its `autostart` action) and refuses while its process runs. A failed
+then its `autostart` action) and refuses while its process runs. A rebind
+keeps every port the binding holds that the definition still declares and
+allocates only one declared since: a port is the instance's for life. A
+failed
 `prepare` is retried with `newgit action <resource>.prepare`; a resource
 with no `prepare` is pointed at the action that builds its tree or its
 long-running action, and one with neither (a `[restore]` alone) at its
 logs.
+
+An instance bound before its definition changed counts too (#85).
+Binding is a moment, not a subscription: an agent that edits
+`.newgit/resources/web.toml` while `web` runs changes nothing in an
+instance bound before, and would otherwise debug behavior that comes from
+the old binding. So `status` holds each ready binding against the
+definition as it stands, one line per resource, naming each difference and
+the commands that apply it:
+
+```text
+  - `web` was bound from an older /repo/.newgit/resources/web.toml: port
+    `extra` declared since, so nothing claims it for this instance; export
+    `APP_URL` changed; `[[render]]` of other.txt added; `prepare` changed
+    since it ran here — apply it with `newgit stop x && newgit resource
+    rebind web x && newgit start x`
+```
+
+What it compares is what newgit would write now against what the record
+says it wrote: the declared ports against the claimed ones, each export
+and each `[[render]]` resolved again as a rebind would resolve it, and the
+`prepare` that last ran (`prepare_rev` on the binding, the one thing the
+record would not otherwise hold). Re-resolving rather than fingerprinting
+the file names the very export or file, and also catches a value that moved
+because a dependency's did, while a comment changes nothing. A running
+process is held against the command its log says it was started with; a
+change to that alone is a restart, `newgit stop x && newgit start x`. The
+rebind line names the stop and start around the rebind only when the
+process runs, since a rebind refuses a running one. What newgit reads each
+time it needs it is never flagged: `[ready]`, `depends_on`, `[identity]
+paths`, ownership, the checkpoint, restore and cleanup hooks, and a port's
+`start`, which only said where its allocation began.
+
+The path in that line is absolute on purpose: definitions are read from the
+project root's `.newgit/resources/`, never from a workspace's copy, so an
+edit made in a workspace takes effect when it reaches the project root.
+Two more cases are named. A resource defined but not bound (added after the
+instance bound its resources) is bound by `newgit resource rebind`. A
+binding whose definition file was deleted by hand, rather than with `newgit
+resource remove`, is named with its process if it runs and the ports it
+still claims; `stop` and `remove` stop that process with `TERM`, and
+`resource rebind` then releases the binding, taking its values out of the
+files it rendered. Its `[cleanup]` went with its definition and cannot run.
 
 A blocked resource counts. Its `prepare` never ran, so it is no more usable
 than one whose `prepare` failed; only where the failure started differs.
@@ -1027,28 +1283,72 @@ fix it. An `autostart` action that did not start counts too: an instance
 whose dev server is down is not up. The instance is not rolled back.
 `--from-checkpoint` judges by the instance the restore leaves (#208).
 
-#### Starting is not failing
+#### Starting is not failing, until its deadline
 
 A dev server that compiles before it listens (Next.js) is doing what it
 should, and a spawn that called it a problem looked like a failure. A running
 process whose port is not answering yet is `starting`, a state of its own:
-not a problem, not "not ready". After the autostart, `spawn` polls the ports
-of what is running for up to five seconds and returns as soon as they answer,
-so a fast server costs nothing. What is still unanswered is then reported as
-starting, not as a failure, with a pointer to `newgit status`:
+not a problem, not "not ready". After the autostart, `spawn` polls what is
+running for up to the longest `timeout_seconds` of what is bound (five
+seconds by default) and returns as soon as everything answers, so a fast
+server costs nothing. A process with no `[ready]` still unanswered is then
+reported as starting, not as a failure, with its log and a pointer to
+`newgit status`:
 
 ```text
 starting: `feature-a`
-  - `app` is still starting: not answering yet on web (3000)
+  - `app` is still starting: not answering yet on web (3000); its log is .newgit/logs/feature-a/app.start-….log
   `newgit status` shows when it is up.
 ```
 
 `status` shows the same state: the STATUS column says `starting` (a real
 problem still says `not ready`, and wins), with the lines under it. It is
 checked at read time, so it clears on its own once the port answers.
-`spawn --json` lists them under `starting` (`resource` and the `ports` that
-have not answered) and exits 0 as for a ready instance. The wait is fixed;
-a server that takes longer simply shows as starting.
+`spawn --json` lists them under `starting` (`resource`, the `ports` that
+have not answered, `check`, and `log`) and exits 0 as for a ready instance.
+
+A port that answers is not always a server that serves: some bind at once
+and answer 500 until they have compiled, and a resource newgit does not
+supervise (a Supabase stack a `prepare` left running) has no process to
+watch at all. A definition's `[ready]` says what up means instead (#276):
+a GET that answers 200–399, or a command that exits 0, and
+`timeout_seconds` for how long that takes. The end of `spawn`, of
+`newgit start` and of `undo` (and so of `spawn --from-checkpoint`) waits
+for the longest of those among what is bound, and a dependent's start
+waits its dependency's (*Spawn*). With no `[ready]`, up
+is the ports answering and the wait is five seconds; a resource with no
+process and no check is up when its `prepare` exited 0. Its declared ports
+are not checked: they are reservations, and the `supabase` template claims
+several a default stack never opens.
+
+Starting has a deadline where one was declared. An agent goes by the exit
+code, and exit 0 says the instance works; "starting" forever, with nothing
+alive to say it might still come up, was that lie for a stack that had gone
+down. So:
+
+- A resource whose definition has a `[ready]` said what up is and how long
+  it takes. Past `timeout_seconds` it is not up: a problem, `not ready` in
+  `status`, and `spawn`, `start` and `undo` exit 1.
+- A resource with no process newgit supervises has nothing alive to tell
+  still-starting from gone-down; it has a `[ready]` check, or it is not
+  checked at all, so the same holds.
+- A supervised process with no `[ready]` has no deadline, because nobody
+  declared one, and most dev servers compile for longer than any default:
+  it is `starting` for as long as it runs. Its line names its log.
+
+The clock is the process's start (when its pid file was written) or, with
+no process, the last `prepare`, `resume` or `restore` that exited 0
+(`.newgit/state/<slug>/<resource>.up`), so `status`, which has no clock of
+its own, gives the same answer `spawn` did. With no record of either, there
+is no grace. A not-up line for a supervised process ends with the last lines
+of its run's log: a dev server that crashed under a wrapper that stayed alive
+(`npm-run-all`) is a running process, and only its log says why. `spawn`
+prints where the instance's logs are (`logs:`; `logs` in `--json`).
+
+`status` runs an instance's checks side by side, one thread each, and
+`status <instance>` runs only that instance's. An `https://` check uses this
+machine's trust store, so a certificate `mkcert -install` made trusted
+passes; one the machine does not trust says so.
 
 #### Died is not stopped
 
@@ -1069,7 +1369,8 @@ or it outlived a reboot). An `autostart` action in that state makes the
 instance `not ready`, with `newgit action <resource>.<action>` as the retry,
 and `newgit start` starts it again along with what `newgit stop` stopped.
 Severity runs ready < starting < not ready: a died process is a problem, a
-process that is up but not answering yet is not. `newgit cleanup` retires a
+process that is up but not answering yet is not, until its `[ready]`
+deadline has passed. `newgit cleanup` retires a
 dead process's pid to `exited`, not `stopped`, so it does not erase a
 crash.
 
@@ -1089,15 +1390,186 @@ each `suspend` once that resource's dependents are down, and records what
 it took down in `.newgit/state/<slug>/stopped.toml`. `newgit start`
 brings back exactly that, dependencies first, running `resume` before a
 resource's dependents come back, and with it any `autostart` action that
-died on its own since (#261). A resource nobody had started stays
+died on its own since (#261), or that never started though its resource
+is ready: one a spawn held back behind a dependency that was not up (#54),
+or one an undo stopped and could not start again. `status` shows such a
+resource as `not started` and the instance as not ready. A failed restart
+is the process's failure, not the binding's: the binding's `failed` says a
+`prepare`, restore, export or render did not succeed, and is cleared by
+that succeeding, while a process that is not running is cleared by any
+start of it that succeeds. A long-running action without `autostart` that nobody started stays
 stopped. A resource whose dependency did not come back in the same `start`
 is not started, and stays owed, so a dev server is not brought up against a
 database that is still down.
 
 The workspace, trackers, installs, and port claims stay, so the instance
-comes back on the same ports. Both commands do nothing and exit 0 when
-there is nothing to do, so they can run on every settle and unsettle. Both
-exit 1 if any resource failed.
+comes back on the same ports, unless another program took one meanwhile
+(#441). Only newgit respects a claim. So before `start` runs the first
+thing it owes a resource (its `resume`, or else its long-running action),
+it checks each port the resource claimed, once, and only while the
+resource's own process is down: is something listening on it? That is a
+bind with `SO_REUSEADDR` on, as real servers bind, on the loopback and
+wildcard addresses of both families. A port in TIME_WAIT from the
+resource's own server, stopped a moment ago, is free; a Docker wildcard
+listener (#93) is not. Checking before the `resume` means the containers a
+`resume` brings up on the port are not then taken for another program. A
+held port moves to a free one, claimed under the port lock: the binding
+record, the exports, and the rendered files all change to it, and `start`
+says so (a line on stderr, `moved_ports` in `--json`). One that cannot
+move fails the resource, naming the port. A dependent over `depends_on`
+that is still running was started with the old port in its environment,
+which now reaches the other program, so `start` stops it and starts it
+again after the resource, with a warning that says so. A running resource
+that only reads the moved exports, with no `depends_on`, is named in a
+warning instead.
+
+Both commands do nothing and exit 0 when there is nothing to do, so they
+can run on every settle and unsettle. Both exit 1 if any resource failed.
+
+`newgit stop --evict` also frees the instance's disk, for an instance
+nobody will touch for a while. After the stop, it checkpoints the instance
+(reason `evict`) and saves what neither the checkpoint nor the tracker
+store carries. What Git keeps only in the workspace's `.git/` goes into the
+store under `refs/newgit/evicted/<slug>/`: local branches, tags, every
+stash entry, what is staged, notes (`refs/notes/*`), and the
+remote-tracking refs of remotes other than `origin`. The rest goes into
+`.newgit/state/<slug>/evicted/`: the workspace's `.git/config`, its hooks
+(all but Git's `*.sample` files), its remote token, the mode of every file
+and directory whose mode is not what a fresh checkout gives (`0644`, or
+`0755` when executable; `0755` for a directory), the empty directories,
+and each install store key its trees had. Then it records the checkpoint
+in the binding record as `evicted`, moves the workspace aside, writes its
+marker back at the path, and deletes what it moved. The marker stays so
+that commands run at the path still find the instance, and a tool holding
+the path still finds a directory.
+
+`newgit start` restores first. It clones the workspace again beside the
+path, as `spawn` does, and moves the clone into the directory that is
+there, so a shell sitting in the marker's directory is in the workspace
+afterwards, not in a deleted one. The rest runs at the path itself,
+because resources are path-dependent (`NEWGIT_WORKSPACE`, a venv, a
+rendered `node_modules`). It writes the checkpoint's tracker content, then
+undoes to that checkpoint. That brings back the source with its
+uncommitted work, tracker content (an encrypted tracker decrypted from this
+machine's cache or key), renders, and the trees resources rebuild, filled
+from the install store. Then it puts back the refs, the stash, what was
+staged, the hooks, and the config. A config key the new clone already has
+is newgit's own (its remote, push routing, the sparse checkout) and keeps
+newgit's value, except `branch.*`, which is the user's (upstreams,
+descriptions); every other key comes back as it was (`user.*`, other
+remotes). Last it makes the empty directories again and puts back the
+modes, clears `evicted`, and starts what the stop stopped.
+
+The promise is that the `start` gives back exactly what was there, or that
+the eviction refuses and deletes nothing. So it refuses, before anything is
+stopped, when the workspace holds what would not come back: a merge,
+rebase, cherry-pick, revert, or bisect in the middle, or unresolved
+conflicts; changes in a dropped tracker's paths (as `undo` refuses); hand
+edits to a rendered file; an untracked directory that is a repository of
+its own, which `git add -A` records as a commit id; an initialized
+submodule, recorded the same way and kept in `.git/modules`; a worktree
+linked to the workspace (`git worktree add`), whose Git is in
+`.git/worktrees`; and ignored files that no bound tracker outside Git owns
+and no bound `recompute` resource rebuilds, such as `target/` or a stray
+`.env.local`. It names those, a wholly ignored directory as one entry with
+its file count, and `--discard-ignored` evicts anyway, naming them again
+(`discarded` in `--json`). Build output a tool refills on its own is
+declared `disposable` by a resource
+([#447](https://github.com/Spheroman/newgit/issues/447)):
+
+```toml
+# .newgit/resources/build-output.toml
+ownership = "workspace"
+disposable = ["target", ".next/cache"]
+```
+
+A plain `--evict` then drops the ignored files under those paths with the
+workspace, says so (`disposed` in `--json`, each path with its resource and
+file count, and `status` while the instance is evicted), and the `start`
+after it leaves them for the build to refill. The refusal names this
+declaration. It is a resource, not a project-level `[evict]` list, because
+build output is path-dependent state that is recomputed, never copied,
+which is what resources are for, and because a resource is bound per
+instance: one a tracker brings (`resources = [...]`) stops counting in an
+instance that drops that tracker. It has no `prepare`, no identity, and no
+hook, so no `undo`, `tracker use`/`drop`, or `spawn` ever touches the tree:
+a declaration with no lifecycle holds for every instance the moment it is
+written. It only ever drops *ignored* files (anything else is in the
+checkpoint), and a file under it that a tracker outside Git owns is kept.
+The first way tried, an install-shaped resource (`[identity]` on
+`Cargo.lock`, `produces = ["target"]`), had to either empty a live
+`target/` from its `prepare` on an `undo` across `Cargo.lock` or fill the
+install store with gigabytes of build output. It also refuses
+while a process other than itself has its working directory in the
+workspace, judged again right before the move: the shell or agent it was
+run from included, since the directory would be deleted under it, so it
+has to run from outside the workspace. `lsof` (on macOS) runs with `-b`,
+so it does not block on a dead network mount, and under a timeout: when it
+does not answer, the eviction refuses, deleting nothing. A refusal names
+each process by pid, command, and directory. And it refuses when a resource
+would not stop, when the checkpoint is degraded, and when the checkpoint
+is not whole in the store: every object its source commit and tracker
+revs reach, checked object by object past what the store's other refs
+already reach (Git keeps those whole). The checkpoint has to be whole on
+this machine, not on the remote: only the workspace is deleted. When the
+remote did not take it, the eviction says so plainly: the only copy of the
+instance's work is then in the project store on this machine.
+
+Not kept, and said before anything is deleted (`not_kept` in `--json`):
+reflogs other than the stash's, intent-to-add (`git add -N`) entries,
+assume-unchanged or skip-worktree flags set by hand (the content of those
+files is kept; only the flag is lost), setuid, setgid, and sticky bits
+(the mode's permission bits are kept, and a mode is put back with `lstat`,
+never through a symlink), and a value set by hand on a config key newgit
+sets itself on restore (`origin`'s URLs and receive-pack, `credential.*`,
+its export remotes), worked out by making newgit's own config in a scratch
+repository. Of every other config key the clone already has, a
+single value comes back as it was and a multi-valued key (an added
+`remote.origin.fetch`) gets the saved values added beside newgit's. Evicting does not free the disk an
+untracked file's content takes, since its blob is in the store with the
+checkpoint, until a restore brings that checkpoint back, a later eviction
+supersedes it, and `newgit cleanup` collects it (see *Cleanup*). Each cycle
+adds an evict checkpoint and the one or two before-undo checkpoints its
+restore's undo takes; a restore that succeeds stamps the evict checkpoint
+`restored` and marks those `restore_of` it, for `cleanup`.
+
+A crash or a failure part way loses nothing. A crash after the record says
+`evicted` and before the move leaves the original workspace at the path,
+with `.git/newgit-evicting` naming the checkpoint: `start` recognises it
+and clears `evicted`, and `stop --evict` then evicts again. The move aside
+is one rename, so otherwise the path holds its marker or nothing. The
+moved-aside workspace (`.<name>.evicting`) holds only what the checkpoint
+holds; it is deleted right away, a read-only directory in it made
+writable first. If it cannot be, the eviction says so and how, and the next
+`start` or `stop --evict` tries again: `stop --evict` before it stops or
+records anything, refusing with what to do when it still cannot.
+
+A restore writes `.newgit/state/<slug>/evict-restoring` and keeps
+`evicted` until it is done. A restore never deletes what is at the path,
+since an editor, a language server, or a shell sitting in the marker's
+directory may have written there while it ran. One that fails moves what
+is at the path, whole, to `.<name>.restore-failed` beside it, puts the
+marker back, and keeps `evicted`, so the next `start` runs it again. One
+that is killed part way leaves half a workspace that anyone may have
+worked in since: the next `start` moves it, whole, to
+`.<name>.interrupted-restore`, and then restores. A second one gets `-2`,
+and so on. These are *saved copies*: each carries no instance marker, is recorded in
+the instance's binding record (`saved_copies`) before anything moves into
+it, and is named, with what to do, on stderr the moment it is made and by
+every `start`, `status`, `stop --evict`, and `cleanup` after. `cleanup`
+never takes one for an orphan workspace, and `remove` keeps them and names
+them. Only `newgit cleanup --discard-saved <path>` deletes one. A restore
+refuses when something other than the marker was written at the path since
+an eviction or a failed restore, and so does `stop --evict`, rather than
+report nothing to do. `remove` refuses too, naming what is there, unless
+`--force`. (A `remove` of an instance that is not evicted checkpoints it
+first; see *Remove*.) While an
+instance is evicted, commands that need its workspace (`checkpoint`,
+`undo`, `run`, `merge`, ...) say it was evicted and to run `newgit start`.
+A second `stop --evict` says it is already evicted to its checkpoint.
+`status` shows it as `evicted`, `cleanup` does not treat it as an instance
+whose workspace is gone and keeps the install store entries its restore
+refills from, and `remove` deletes what the eviction kept.
 
 `suspend` never runs for a `project` or `user` resource, which other
 instances share, nor for one that never came up. The `supabase` template's
@@ -1115,10 +1587,88 @@ a checkpoint that bound less parks the same way.
 
 ### Remove
 
-`newgit remove <name>` stops what is running (dependents first), runs
-`[cleanup]` hooks where ownership allows — for parked bindings too, unless
-their drop already ran it — deletes the workspace (`rm -rf`;
-clones have no registration), and archives the binding record.
+`newgit remove <name>` checkpoints the workspace (reason `remove`), stops
+what is running (dependents first), runs `[cleanup]` hooks where ownership
+allows — for parked bindings too, unless their drop already ran it —
+deletes the workspace (`rm -rf`; clones have no registration), and
+archives the binding record, which names the checkpoint (`removed_to`).
+
+**Remove never deletes work no checkpoint holds**
+([#448](https://github.com/Spheroman/newgit/issues/448)). Before anything
+is stopped, it takes a checkpoint as `stop --evict` does: uncommitted,
+untracked, and staged work, the workspace's commits (which the store then
+holds, so the branch rule below sees them), tracker content, and resource
+state, captured while the resources still run. `newgit spawn <name>
+--from-checkpoint <name>/<id>` brings the workspace back. "Remove, and I
+can undo it" is the obvious reading of a remove that keeps checkpoints,
+and refusing a dirty workspace instead would make every unattended caller
+(T3 Code deletes a thread with a plain `newgit remove`) either fail or
+learn `--force` and lose the work anyway. The checkpoint neither syncs to
+the remote, which the instance leaves a moment later, nor re-encrypts an
+encrypted tracker's rev to a changed audience, so a removal never waits on
+the network.
+
+An evicted instance is not checkpointed again: the checkpoint it was
+evicted to holds its workspace, and is the one the archived record names
+(`removed_to`) and `remove` reports. That is T3 Code's most common path, a
+thread whose workspace was evicted at the end of a turn and then deleted.
+
+What a checkpoint cannot hold is named as lost (`lost` in `--json`), never
+deleted in silence: ignored files no tracker outside Git owns and no
+resource rebuilds (`target/`, with its file count), changes in a dropped
+tracker's paths, hand edits to rendered files, a merge or rebase in
+progress, the stash, branches and tags only the workspace has, staged
+content the working tree has moved past, a Git repository nested in the
+workspace (a checkpoint records only the commit it has checked out, so its
+files go; `lost` says how many uncommitted changes and commits on no
+remote it had). Ignored paths a resource declares `disposable` are listed
+as dropped, not lost.
+
+A resource capture that fails (a `pg_dump` against a database that is
+down) does not refuse the removal when the resource's state is outside
+the workspace: the checkpoint goes ahead without that resource, as it
+does for a resource that is not up. But its state is then in no
+checkpoint, so its `[cleanup]` does not run: a `dropdb` after a failed
+dump would delete the only copy, unattended. The state stays where it
+is, and the removal says so (`left:`, `left` in `--json`, hook status
+`skipped-uncaptured`), with the cleanup command as it would have run,
+which names where the state is and removes it by hand. `--force` runs it,
+and names what that deleted as lost.
+
+When the resource's state is in the workspace, it cannot stay where it
+is: the workspace is what the removal deletes. A Postgres cluster whose
+data directory is in the tree is the case. So that failed capture
+refuses the removal, deleting nothing (the checkpoint it took holds the
+rest), unless `--force`, which names the state as lost. Where the state
+is comes from the definition, `ownership = "workspace"`: newgit cannot
+see where a command keeps what it captures, and the ignored files the
+removal deletes cannot be told apart from build output, so a guess from
+them would either refuse every removal with a `build/` in it or let the
+database go. A resource that keeps its data in the tree but declares
+another ownership is taken at its word.
+
+A checkpoint that fails refuses the removal, deleting nothing, unless
+`--force`, which removes anyway. So does a nested repository with no
+commit, which `git add` refuses, and a workspace whose Git cannot be read;
+each refusal names `--force`. `--purge` takes no checkpoint (it discards
+them all). With no checkpoint (`--purge`, or `--force` past a failed one)
+`lost` names the uncommitted work it deletes and, per bound tracker
+outside Git, the paths whose content differs from its bound rev (compared
+without capturing). Under `--force` or `--purge` the analysis is
+best-effort: what could not be read is named (`could not inspect ...;
+whatever it held`) rather than refusing.
+
+A removal that fails after its checkpoint leaves that checkpoint; the
+retry takes another, and `cleanup` collects the earlier one. A checkpoint
+that fails partway deletes the store ref it wrote.
+
+Every instance spawned under a name shares its checkpoint history, so
+each checkpoint record names the instance that took it (`instance`, the
+instance id). `cleanup` collects a `remove` checkpoint only when the same
+instance took a later one: a later instance's removal is its own work,
+not a retry. Archived records are never replaced: each claims its name
+(`<slug>-<timestamp>.toml`, `.<n>` added when an earlier removal took it
+in the same second) before the record is moved onto it.
 
 **The source branch** goes too, when it holds nothing unique, and otherwise
 stays with the reason printed. It is deleted only when all of these hold:
@@ -1143,13 +1693,17 @@ silently adopt it. A squash-merged branch whose remote branch was deleted
 looks unique and is kept: the safe miss, named with the command to finish
 the job. `--keep-branch` and `--delete-branch` override.
 
-What `remove` cannot protect is work done since the last checkpoint. When
-no ref holds the workspace's `HEAD`, it says that work is lost, so "nothing
-unique on the branch" never reads as "nothing lost".
+With no checkpoint first (`--purge`, or `--force` past a failed one),
+when no ref holds the workspace's `HEAD`, it says the commits since the
+last checkpoint are lost, so "nothing unique on the branch" never reads as
+"nothing lost".
 
 **Checkpoints outlive removal.** They pin what their undo would need, and
 newgit never breaks an undo on its own initiative. `remove` reports how
-many it kept; `--purge` discards them.
+many it kept; `--purge` discards them: the ones this instance took, never
+an earlier instance's under the same name, nor one an archived record
+names (`removed_to`, `evicted`). `cleanup --purge-archived` discards a
+name's whole history once no live instance has it.
 
 ### Cleanup
 
@@ -1167,16 +1721,65 @@ reports exactly what a real run would do. It:
 - **clears dead process state** and lock files of instances with no record.
 - **prunes tracker revisions nothing references**, and garbage-collects at
   once, so pruned content (possibly a secret) is gone rather than merely
-  unreachable. It never deletes a checkpoint record or a revision a
-  checkpoint points at, and reports how many it kept for that reason, so
-  retained disk is explained.
+  unreachable. It never deletes a revision a checkpoint points at, nor a
+  checkpoint record beyond what retention collects (below), and reports how
+  many it kept for that reason, so retained disk is explained.
 - **prunes the install store** (see *Installs*).
+- **collects what eviction leaves behind**
+  ([#446](https://github.com/Spheroman/newgit/issues/446)), only what is
+  proven to be nobody's only copy. History is kept by slug and outlives an
+  archived record, so a later instance with the same name shares it. In
+  each slug's history, live or archived, it collects an `evict`
+  checkpoint a restore brought back and that succeeded (`restored`), once
+  a later eviction supersedes it; every checkpoint a restore that
+  succeeded took on its way (`restore_of`: the marker and a clone); and a
+  `remove` checkpoint the same instance took a later one after (a removal
+  that failed after its checkpoint, retried). It never collects an `evict` checkpoint nothing
+  restored, since an instance removed while evicted keeps its work only
+  there. Nor does it collect one any live or archived record names
+  (`evicted`, `removed_to`), a before-undo that a person's own `undo` took
+  (its redo point), one a restore that failed took (it may hold what was
+  written at the path meanwhile), or an `explicit` or `push` checkpoint. It
+  also collects checkpoint refs no record names (a checkpoint killed
+  between writing its ref and its record). It deletes each record and the
+  store ref of its source, so the tracker revisions only they held are
+  pruned in the same pass. A collected id is never handed out again. It
+  reports the bytes of store objects only they reached (`git rev-list
+  --disk-usage`) as now unreachable. **newgit does not prune the store**:
+  the publish outbox (`.newgit/local/publish/outbox.git`) borrows the
+  store's objects through alternates, so a prune of the store can corrupt
+  it, and the user's own `gc.pruneExpire`, `gc.auto`, and `git maintenance`
+  decide when unreachable objects go (by default two weeks, which is also
+  how long `git fsck` can recover a dropped stash). Each slug's lock is held
+  only while its records are read or deleted. An evict checkpoint is not
+  always "nobody's work": in T3 Code it is often the only checkpoint of a
+  turn's end state. That is why one is collected only after a restore
+  proved the workspace holds it again and a later eviction moved past it.
+  **A collected checkpoint is gone for `undo --to` too**: that is the
+  decision, since each one is a state the instance was in only on its way
+  somewhere else. A state worth keeping is kept with `newgit checkpoint`,
+  which nothing collects. The copies a checkpoint sync sent to the remote
+  are not touched.
 
 That conservatism is a dead end for archived instances: `undo` needs a
-binding record, so their checkpoints can never be restored, yet they pin
-revisions forever. `cleanup --purge-archived` discards them, with their
+binding record, so their checkpoints come back only through `spawn
+--from-checkpoint`, yet they pin revisions forever. `cleanup --purge-archived` discards them, with their
 checkpoint refs. It is opt-in and never touches a live instance. The
 ordinary report says how many retained revisions it would free.
+
+**Landed instances are most of the disk, and cleanup should name them
+(planned, #422).** Workspaces are disposable, but nothing disposes of
+them: instances accumulate after their work merges, each holding a full
+build tree. On this project's own machine, 90 of 122 instances held 321 GB
+of `target/` alone, with the disk 98% full; removing the 61 whose work had
+landed freed 150 GB. An instance has **landed** when its workspace has
+nothing uncommitted and its tip is on the project's default branch or on a
+branch the remote has, or its branch's pull request merged. `cleanup`
+lists landed instances with what each holds on disk, and `cleanup
+--landed` removes them as `remove` would: branch kept when unique,
+checkpoints kept. It stays opt-in, because newgit cannot see what else is
+attached to a workspace: a T3 Code thread or an editor still pointed at
+it.
 
 ### One command per instance at a time
 
@@ -1264,7 +1867,11 @@ checkpoint taken off the branch with `` [on `try-x`] ``.
 A resource's restore is one of `none`, `command`, `recompute` (re-run an
 action, `prepare` by default, when the identity changed), or `external`.
 `recompute` is correctness for path-dependent artifacts, not an
-optimization, and it fills from the install store when it can.
+optimization, and it fills from the install store when it can. A tree
+recomputed from its inputs holds nothing a dependent generated into it
+(`prisma generate` into `node_modules`), so once an undo recomputes a
+resource, every `recompute` dependent after it recomputes too, whatever its
+own identity says.
 
 A resource the checkpoint holds no state for (one it went ahead without)
 keeps its state when its restore is a `command`. Running the restore with
@@ -1286,6 +1893,25 @@ and a retry command next to the checkpoint, and exits 1. A restore that ran
 nothing does not make a resource `ready`: a resource that was failed before
 the undo is still failed after it, and the report says what each resource
 is left as (#211).
+
+What an undo leaves when a restore fails is deliberate: that resource
+down, and everything that depends on it down too. A server started over
+state its restore left half done serves it as if it were fine, and a
+dependent started against it reads as up while it serves the wrong data.
+The binding records why (`restore_error`), so `status` says `failed to
+restore` and names the retry, another undo, rather than the action that
+starts the process. The next undo that succeeds brings them all back.
+
+A restore runs with its own process stopped (every process is stopped
+before content moves) and its dependencies restored and, when they were
+running, started again; a restore that runs something waits for those to
+be up, as a dependent's process does. A restore that needs its own server
+starts one around the load: the `postgres` template loads the dump into a
+fresh cluster under a temporary server on the instance's port and swaps it
+in only once the load succeeded. newgit offers no "restore with the process
+up": loading into the live server is what forces a restore to reset the
+database first, and a reset followed by a failed load is the half-done
+state above.
 
 The safety checkpoint taken before an undo is annotated with whether that
 undo completed. A pre-undo snapshot before a failed undo is not a real
@@ -1371,12 +1997,32 @@ inherits its export, so what leaves fails closed. A target declared by a
 tracker other than root is rooted at it, its files at the top. Definitions
 live in `access`, so widening where something ships takes an owner's merge.
 An inheriting tracker whose audience is narrower than the declaring one's
-is refused rather than sent past it, and a history that ever committed a
-file a tracker outside Git owns is refused. It
+is refused rather than sent past it, and a commit the target does not have
+yet that adds a file a tracker outside Git owns is refused: what the target
+has, asked of it each time, is published already and is not judged again
+(#444). It
 pushes with your own Git credentials, so GitHub Actions and `gh` keep
 working. When the target's branch has moved ahead (a pull request merged on
-GitHub), export brings that in first. With `branches = true`, every push
-from a workspace exports its branch there too.
+GitHub), export brings that in first. A target force-pushed to purge
+something is not merged with: plain `pull --remote` and export refuse and
+name `newgit pull --remote <target> --force`, which resets the rooted
+tracker's line to the target's, lists what it drops and who still holds
+it, and refuses to carry it onward from this machine; the project's own
+history still pins it ([trackers.md](trackers.md), *Following a
+force-push*). Every push to a target from a client, of `main`, of an
+instance's branch, or of a tag, passes that check (the remote's own export
+of its GitHub mirrors does not yet, [serve.md](serve.md)), but it reads this machine's record of what
+it last exported there: with no record, or a record older than another
+machine's export, a rewrite cannot be told from history of the target's
+own (#473). With `branches = true`, every push from a workspace exports its
+branch there too: the target's `main` plus the instance's own commits,
+whichever was exported first. `newgit export <instance> --remote <name>`
+exports that branch again as last pushed, for an export that failed, or
+with `--force` to replace it whatever it holds. A branch whose commits
+there were built on a copy of what the target's `main` holds is replaced,
+only while the target holds exactly what newgit last pushed there by its
+own record, so a commit someone else pushed is never thrown away
+([`trackers.md`](trackers.md), *One commit, one root commit*).
 
 ### The remote
 
@@ -1405,22 +2051,35 @@ Git repository per tracker. It gives you:
 
 Open issues that change what this document can promise:
 
-- **#54: starting is not waiting.** `depends_on` orders `prepare`,
-  autostart, and `newgit start`, but a dependent starts once its
-  dependency's process exists, not once it answers. `newgit action
-  app.start` by hand does not start the database it needs.
+- **#54: `newgit action app.start` by hand does not start what it needs.**
+  It refuses while a dependency is down, naming it, rather than starting
+  it as `docker compose up app` would.
 - **#64: rendered files are hidden, not filtered.** `--skip-worktree` makes
   hand edits to a rendered file die with the workspace. A clean/smudge
   filter would make them ordinary, committable edits.
-- **#83: gitignored secrets do not reach a workspace** unless a tracker owns
-  them, and nothing at spawn says so.
-- **#85: no reconcile.** A live instance does not pick up a changed
-  resource definition (a new port, say), and nothing says it is stale.
-- **#87: no preflight.** A definition that calls a missing binary (`pg_dump`
-  on a host without Postgres) fails at the first checkpoint or, worse, the
-  first restore.
+- **#83: gitignored secrets reach a workspace only through a tracker.**
+  `spawn` names the ones it left behind, by file name, and the commands
+  that carry them; nothing carries them by itself.
+- **#85: reconcile is asked for, not automatic.** A live instance does not
+  pick up a changed resource definition by itself: `status` names each
+  difference and the commands that apply it, and the agent runs them. A
+  rebind does not rebind what depends on the resource (#289): `status` then
+  names a dependent's export or render that moved with it, but not a
+  process started with an environment that has since changed (another
+  resource's export, a port's `env` name).
+- **#87: preflight is asked for, not automatic.** `newgit resource check`
+  finds a definition calling a missing binary (`pg_dump` on a host without
+  Postgres); nothing runs it at spawn, so one never checked still fails at
+  the first checkpoint or, worse, the first restore.
 - **#89: a failed `prepare` can destroy its own evidence**, when the tool
-  tears down its containers before exiting.
+  tears down its containers before exiting. newgit destroys none of it
+  itself: every run has its own log, and nothing it runs after a failure
+  removes what the command left. It shows the whole command that ran and
+  how its log ends (stderr only when `captures` is set), and the reference
+  says how to rerun the tool by hand with its own keep-it-up flag; it
+  cannot keep the containers itself, and there is no generic
+  `--keep-failed`, since newgit runs nothing after a failure for one to
+  switch off.
 - **#59: port allocation order within a resource is unspecified**, which
   matters when a tool's default ports are consecutive.
 - **Install store follow-ups:** sub-path exclusions in `produces` for native

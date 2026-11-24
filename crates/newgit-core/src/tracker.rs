@@ -30,7 +30,7 @@ pub struct TrackerDefinition {
     /// exclusions included: what [`Self::to_file`] writes back.
     pub claims: Vec<String>,
     /// Workspace-relative paths its claims exclude (`!node_modules/`): owned
-    /// only by a tracker that claims them at the same mount, or by nothing.
+    /// by the longest other claim that reaches them, or by nothing.
     pub exclusions: Vec<Utf8PathBuf>,
     /// Whether its content is committed to Git (and split into the tracker's
     /// own history). False unless a definition says otherwise: the content
@@ -62,6 +62,11 @@ pub struct TrackerDefinition {
     /// pins its own commit of it, and its home's definition says who may read
     /// and change it.
     pub link: Option<String>,
+    /// The tracker whose history this one started at (`from = "local-db"`,
+    /// written by `newgit tracker create --from`): a fork, so the two share
+    /// history and can merge. Its audience is a ceiling: a fork is never
+    /// readable by anyone its upstream is not ([`fork_problems`]).
+    pub from: Option<String>,
     /// Trackers or roles it cannot do without: binding it binds them, and
     /// they cannot be dropped while it is bound.
     pub requires: Vec<String>,
@@ -71,11 +76,18 @@ pub struct TrackerDefinition {
     /// `"inherit"`, its parent's. Empty means it never ships, which fails
     /// closed. Only a tracker in Git has one.
     pub export: Vec<ExportEntry>,
-    /// Paths inside this tracker's own that a more specific tracker owns, so
-    /// they are not this tracker's to capture, restore, or clear. Computed
-    /// from the full set of definitions ([`resolve_ownership`]); not part of
-    /// the definition file.
+    /// Paths inside this tracker's own that it does not own (another
+    /// tracker does, or nothing does), so they are not this tracker's to
+    /// capture, restore, or clear. Something inside one may be its own
+    /// again: [`Self::owns`] decides. Computed from the full set of
+    /// definitions ([`resolve_ownership`]); not part of the definition file.
     pub excluded: Vec<Utf8PathBuf>,
+    /// What [`owner_of`] decides inside this tracker's claims, as the paths
+    /// where the answer can change (every claim, exclusion, and mount of
+    /// every definition) and whether this tracker owns each: a path is
+    /// decided by the longest of them holding it. Computed by
+    /// [`resolve_ownership`]; empty until then.
+    pub ownership: Vec<(Utf8PathBuf, bool)>,
     /// The tracker in Git that defines this one in its own
     /// `.newgit/trackers/`, so its own commits pin it and it goes wherever
     /// that tracker goes. `None`: root's, defined in `access`.
@@ -171,6 +183,8 @@ pub struct TrackerDefinitionFile {
     pinned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     link: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     requires: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -252,10 +266,12 @@ impl TrackerDefinition {
             priority: 0,
             pinned: false,
             link: None,
+            from: None,
             requires: Vec::new(),
             resources: Vec::new(),
             export: Vec::new(),
             excluded: Vec::new(),
+            ownership: Vec::new(),
             parent: None,
             definition_rev: String::new(),
         };
@@ -287,10 +303,12 @@ impl TrackerDefinition {
             priority: 0,
             pinned: false,
             link: None,
+            from: None,
             requires: Vec::new(),
             resources: Vec::new(),
             export: Vec::new(),
             excluded: Vec::new(),
+            ownership: Vec::new(),
             parent: None,
             definition_rev: String::new(),
         };
@@ -367,10 +385,12 @@ impl TrackerDefinition {
             priority: file.priority,
             pinned: file.pinned,
             link: file.link,
+            from: file.from,
             requires: file.requires,
             resources: file.resources,
             export,
             excluded: Vec::new(),
+            ownership: Vec::new(),
             parent: None,
             definition_rev: format!("sha256:{hex}"),
         };
@@ -394,6 +414,14 @@ impl TrackerDefinition {
                      `<owner>/<project>` or `<owner>/<project>/<path>`, and this tracker must be `git = true`"
                 )));
             }
+        }
+        if let Some(from) = &self.from
+            && (from == &self.name || from.is_empty())
+        {
+            return Err(self.invalid(format!(
+                "`from = \"{from}\"` names the tracker whose history this one started at, \
+                 which must be another tracker"
+            )));
         }
         if let Some(maintainers) = &self.maintainers {
             let ok = matches!(maintainers.as_str(), "owner" | "project-devs")
@@ -444,11 +472,8 @@ impl TrackerDefinition {
             if path.as_str() == "." || is_project {
                 continue;
             }
-            if path.is_absolute()
-                || path.as_str().is_empty()
-                || path.components().any(|c| c.as_str() == "..")
-            {
-                return Err(self.invalid(format!("path `{path}` must be workspace-relative")));
+            if let Some(problem) = not_relative(path) {
+                return Err(self.invalid(problem));
             }
             // Except a tracker's definition: whoever may change the tracker
             // owning `web.toml` decides who may read `web`, so governance
@@ -505,6 +530,51 @@ impl TrackerDefinition {
         Ok(updated)
     }
 
+    /// A fork of this tracker, as `newgit tracker create <name> --from
+    /// <this>` writes it: the same claims at the same mount, filling `role`,
+    /// and `from` naming this one. It brings no resources and requires
+    /// nothing: those are what make members of a role differ. Bound only
+    /// when asked for (`priority` below this one's, and negative), so making
+    /// a fork never changes what anything binds by default.
+    pub fn fork_as(
+        &self,
+        name: &str,
+        audience: String,
+        storage: Storage,
+        merge_with_source: bool,
+        role: String,
+    ) -> Result<Self> {
+        let mut fork = self.clone();
+        fork.name = name.to_owned();
+        fork.audience = audience;
+        fork.storage = storage;
+        fork.merge_with_source = merge_with_source;
+        fork.maintainers = None;
+        fork.role = Some(role);
+        fork.priority = self.priority.min(0) - 1;
+        fork.pinned = false;
+        fork.link = None;
+        fork.from = Some(self.name.clone());
+        fork.requires = Vec::new();
+        fork.resources = Vec::new();
+        fork.export = Vec::new();
+        fork.excluded = Vec::new();
+        fork.ownership = Vec::new();
+        fork.parent = None;
+        fork.validate()?;
+        fork.definition_rev = fork.compute_definition_rev()?;
+        Ok(fork)
+    }
+
+    /// This definition filling `role`.
+    pub fn with_role(&self, role: &str) -> Result<Self> {
+        let mut updated = self.clone();
+        updated.role = Some(role.to_owned());
+        updated.validate()?;
+        updated.definition_rev = updated.compute_definition_rev()?;
+        Ok(updated)
+    }
+
     pub fn with_added_paths(&self, paths: &[Utf8PathBuf]) -> Result<Self> {
         let mut updated = self.clone();
         for path in paths {
@@ -535,6 +605,7 @@ impl TrackerDefinition {
             priority: self.priority,
             pinned: self.pinned,
             link: self.link.clone(),
+            from: self.from.clone(),
             requires: self.requires.clone(),
             resources: self.resources.clone(),
             export: export_value(&self.export),
@@ -561,10 +632,12 @@ impl TrackerDefinition {
             priority: 0,
             pinned: false,
             link: None,
+            from: None,
             requires: Vec::new(),
             resources: Vec::new(),
             export: Vec::new(),
             excluded: Vec::new(),
+            ownership: Vec::new(),
             parent: None,
             definition_rev: String::new(),
         };
@@ -595,10 +668,12 @@ impl TrackerDefinition {
             priority: 0,
             pinned: false,
             link: None,
+            from: None,
             requires: Vec::new(),
             resources: Vec::new(),
             export: Vec::new(),
             excluded: Vec::new(),
+            ownership: Vec::new(),
             parent: None,
             definition_rev: String::new(),
         };
@@ -606,6 +681,15 @@ impl TrackerDefinition {
             .compute_definition_rev()
             .expect("the access definition serializes");
         definition
+    }
+
+    /// Whether its content is encrypted to its audience before it leaves
+    /// this machine (#338): outside Git, synced (`storage = "remote"`), and
+    /// not `public`. There is no opt-out: content a server has to read is
+    /// `public`. A tracker in Git stays plaintext (Git composes it on the
+    /// server); so does one kept on this machine, which never leaves it.
+    pub fn encrypted_to_audience(&self) -> bool {
+        !self.git && self.storage == Storage::Remote && self.audience != "public"
     }
 
     /// Committed content with its own history, composed into workspaces
@@ -619,19 +703,19 @@ impl TrackerDefinition {
         self.paths.iter().any(|path| path.as_str() == ".")
     }
 
-    /// Whether `relative` is this tracker's: under one of its paths, not
-    /// under one of its exclusions, and not under a more specific tracker's.
+    /// Whether `relative` is this tracker's: what [`owner_of`] decides over
+    /// the definitions [`resolve_ownership`] settled (this tracker, or a
+    /// role alternative of it with the same claim). Before that, judged by
+    /// its own claims alone.
     pub fn owns(&self, relative: &Utf8Path) -> bool {
-        let claimed = self
-            .paths
+        if self.ownership.is_empty() {
+            return !owners_of(std::slice::from_ref(self), relative).is_empty();
+        }
+        self.ownership
             .iter()
-            .any(|path| path.as_str() == "." || relative.starts_with(path));
-        claimed
-            && !self
-                .exclusions
-                .iter()
-                .any(|path| relative.starts_with(path))
-            && !self.excluded.iter().any(|path| relative.starts_with(path))
+            .filter(|(prefix, _)| under(relative, prefix))
+            .max_by_key(|(prefix, _)| prefix_length(prefix))
+            .is_some_and(|(_, owned)| *owned)
     }
 
     /// Mounted somewhere other than the workspace's root.
@@ -675,6 +759,31 @@ pub fn is_default_definition(relative: &Utf8Path, contents: &str) -> bool {
         })
 }
 
+/// Why `path`, normalized ([`normalize_path`]), is not workspace-relative:
+/// absolute, empty, or reaching out with `..`. Every claim, exclusion, and
+/// mount of a definition is held to it when the definition is loaded.
+pub fn not_relative(path: &Utf8Path) -> Option<String> {
+    (path.is_absolute()
+        || path.as_str().is_empty()
+        || path.components().any(|c| c.as_str() == ".."))
+    .then(|| format!("path `{path}` must be workspace-relative"))
+}
+
+/// Why a definition's `mount`, as its file writes it, is refused when the
+/// definition is loaded, or `None` when it is accepted: normalized
+/// ([`normalize_path`], so `./a/` and `a//b` are `a` and `a/b`), it is `.`
+/// or workspace-relative ([`not_relative`]). `newgit serve` holds a
+/// definition landing on `main` to the same rule, with the same message
+/// ([`crate::error::NewgitError::InvalidDefinition`]), so the two never
+/// disagree about where a tracker sits.
+pub fn mount_problem(written: &str) -> Option<String> {
+    let mount = normalize_path(Utf8Path::new(written));
+    if mount.as_str() == "." {
+        return None;
+    }
+    not_relative(&mount)
+}
+
 /// A tracker path by its components alone, so `./.git`, `.git/` and `.git`
 /// are one path: checked, compared, and written to `.gitignore` as one. `./`
 /// is `.`. A path that is not workspace-relative (absolute, or with `..`) is
@@ -706,11 +815,6 @@ fn is_definition_file(path: &Utf8Path) -> bool {
             .next()
             .is_some_and(|file| Utf8Path::new(file).extension() == Some("toml"))
         && components.next().is_none()
-}
-
-/// Whether `mount` holds `path`: `.` holds everything.
-fn mount_holds(mount: &Utf8Path, path: &Utf8Path) -> bool {
-    mount.as_str() == "." || path.starts_with(mount)
 }
 
 fn mount_depth(mount: &Utf8Path) -> usize {
@@ -747,35 +851,299 @@ impl TrackerDefinition {
     }
 }
 
-/// The owner of `path` among `definitions`, by the ownership rules
-/// (docs/design/trackers.md, *Ownership*): the deepest mount holding the path
-/// decides, a parent's claim of `.` not reaching into it; among the trackers
-/// mounted there, the longest claim wins; a path every claim there excludes
-/// is owned by nothing.
+/// Whether `path` is `prefix` or under it, by whole components: `.` holds
+/// everything.
+fn under(path: &Utf8Path, prefix: &Utf8Path) -> bool {
+    prefix.as_str() == "." || path.starts_with(prefix)
+}
+
+/// How specific a claim is: its length, `.` counting 0.
+fn prefix_length(prefix: &Utf8Path) -> usize {
+    if prefix.as_str() == "." {
+        0
+    } else {
+        prefix.as_str().len()
+    }
+}
+
+/// The tracker mounted deeper than `definition`, around `path`, that keeps
+/// `definition`'s claim `claim` from reaching it (docs/design/trackers.md,
+/// *Ownership*, rule 1): a deeper mount takes its whole mount from a claim
+/// of `.` or of a directory around it, and from every claim of a tracker
+/// in Git. Only a tracker outside Git reaches into a deeper mount, with a
+/// claim inside it.
+fn blocked_by<'a>(
+    definitions: &'a [TrackerDefinition],
+    definition: &TrackerDefinition,
+    claim: &Utf8Path,
+    path: &Utf8Path,
+) -> Option<&'a TrackerDefinition> {
+    let depth = mount_depth(&definition.mount);
+    definitions.iter().find(|other| {
+        other.mounted()
+            && mount_depth(&other.mount) > depth
+            && path.starts_with(&other.mount)
+            && (definition.git || claim.as_str() == "." || other.mount.starts_with(claim))
+    })
+}
+
+/// Every tracker that owns `path` among `definitions`: the one rule
+/// (docs/design/trackers.md, *Ownership*) that the commit gate, split's
+/// check, export, import, pull, and the workspace ([`TrackerDefinition::owns`])
+/// all decide by.
+///
+/// A claim of a tracker whose mount holds `path`, covering `path`, and not
+/// taken out by that tracker's own `!` exclusions, *reaches* it unless a
+/// tracker mounted deeper holds `path` and the claim is `.`, or a directory
+/// around that mount, or the tracker is in Git ([`blocked_by`]). The longest
+/// reaching claim wins. Two trackers tie only on the very same claim, which
+/// only role alternatives may make: both are returned, since a workspace
+/// binds one. Empty: nothing owns `path`.
+pub fn owners_of<'a>(
+    definitions: &'a [TrackerDefinition],
+    path: &Utf8Path,
+) -> Vec<&'a TrackerDefinition> {
+    let claims: Vec<(usize, &TrackerDefinition)> = definitions
+        .iter()
+        .filter(|definition| under(path, &definition.mount))
+        .filter(|definition| {
+            !definition
+                .exclusions
+                .iter()
+                .any(|excluded| path.starts_with(excluded))
+        })
+        .filter_map(|definition| {
+            definition
+                .paths
+                .iter()
+                .filter(|claim| under(path, claim))
+                .filter(|claim| blocked_by(definitions, definition, claim, path).is_none())
+                .map(|claim| prefix_length(claim))
+                .max()
+                .map(|length| (length, definition))
+        })
+        .collect();
+    let Some(best) = claims.iter().map(|(length, _)| *length).max() else {
+        return Vec::new();
+    };
+    claims
+        .into_iter()
+        .filter(|(length, _)| *length == best)
+        .map(|(_, definition)| definition)
+        .collect()
+}
+
+/// The owner of `path` among `definitions` ([`owners_of`]). Of role
+/// alternatives tied on one claim, one outside Git is named first, so a
+/// gate asking "is this a file of a tracker outside Git?" refuses it
+/// whichever one a workspace binds; then the deeper mount, then the lesser
+/// name.
 pub fn owner_of<'a>(
     definitions: &'a [TrackerDefinition],
     path: &Utf8Path,
 ) -> Option<&'a TrackerDefinition> {
-    let deepest = definitions
-        .iter()
-        .filter(|definition| mount_holds(&definition.mount, path))
-        .map(|definition| mount_depth(&definition.mount))
-        .max()?;
-    definitions
-        .iter()
-        .filter(|definition| {
-            mount_holds(&definition.mount, path) && mount_depth(&definition.mount) == deepest
-        })
-        .filter_map(|definition| definition.claim_on(path).map(|claim| (claim, definition)))
-        .max_by(|(left, a), (right, b)| left.cmp(right).then_with(|| b.name.cmp(&a.name)))
-        .map(|(_, definition)| definition)
+    owners_of(definitions, path).into_iter().max_by(|a, b| {
+        b.git
+            .cmp(&a.git)
+            .then_with(|| mount_depth(&a.mount).cmp(&mount_depth(&b.mount)))
+            .then_with(|| b.name.cmp(&a.name))
+    })
 }
 
-/// Settle who owns what across every tracker. A path's owner is its most
-/// specific claimant, so trackers may nest — `apps` can hold `apps/electron`
-/// for another tracker — but no two may claim the identical path, and only
-/// one may own `.`. Fills in each definition's `excluded` (paths inside its
-/// own that a more specific tracker owns).
+/// `definition`'s claims that reach nothing: a claim of a tracker in Git
+/// inside a deeper mount, with the tracker mounted there. Such a claim
+/// owns nothing ([`owners_of`]); `tracker list` says so.
+pub fn unreached_claims<'a>(
+    definitions: &'a [TrackerDefinition],
+    definition: &'a TrackerDefinition,
+) -> Vec<(&'a Utf8Path, &'a TrackerDefinition)> {
+    if !definition.git {
+        return Vec::new();
+    }
+    definition
+        .paths
+        .iter()
+        .filter(|claim| claim.as_str() != ".")
+        .filter_map(|claim| {
+            blocked_by(definitions, definition, claim, claim).map(|mount| (claim.as_path(), mount))
+        })
+        .collect()
+}
+
+/// Whether a fork with audience `fork` is readable by no one its upstream's
+/// audience `upstream` does not include: the same audience, or one inside
+/// it. `public` holds every audience, and `project-devs` holds `user` (each
+/// member their own) and `user:<login>` (the remote serves those to members
+/// only). Any other two are not ordered, and are not within each other.
+pub fn audience_within(fork: &str, upstream: &str) -> bool {
+    fork == upstream
+        || upstream == "public"
+        || (upstream == "project-devs" && (fork == "user" || fork.starts_with("user:")))
+}
+
+/// A fork relation a definition may no longer state but that still binds
+/// it: `fork` was a fork of `upstream` (in a parent commit's definitions, or
+/// by this machine's record of it), and `audience` is what `upstream`'s was
+/// then, when known. Dropping or changing `from` does not take the
+/// upstream's history out of the fork's, so the ceiling stays.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EarlierFork {
+    pub fork: String,
+    pub upstream: String,
+    pub audience: Option<String>,
+}
+
+/// Every fork relation `definitions` state, as [`EarlierFork`]s for the
+/// definitions that come after them.
+pub fn forks_in(definitions: &[TrackerDefinition]) -> Vec<EarlierFork> {
+    definitions
+        .iter()
+        .filter_map(|fork| {
+            let upstream = fork.from.clone()?;
+            let audience = definitions
+                .iter()
+                .find(|other| other.name == upstream)
+                .map(|other| other.audience.clone());
+            Some(EarlierFork {
+                fork: fork.name.clone(),
+                upstream,
+                audience,
+            })
+        })
+        .collect()
+}
+
+/// What is wrong with each fork in `definitions`, as `(tracker, why)`, each
+/// `why` saying what to type: an upstream (`from`) that is not defined, an
+/// audience wider than an upstream's, forks of each other in a cycle, or a
+/// fork whose `from` was dropped or changed since `earlier` while its
+/// audience is wider than the upstream it was a fork of. Everything the
+/// upstream held when the fork was made is in the fork's history, so a fork
+/// readable by more people discloses it, whatever its definition says now.
+pub fn fork_problems(
+    definitions: &[TrackerDefinition],
+    earlier: &[EarlierFork],
+) -> Vec<(String, String)> {
+    let mut problems: Vec<(String, String)> = Vec::new();
+    let find = |name: &str| definitions.iter().find(|other| other.name == name);
+    let remove = |name: &str| format!("`newgit tracker remove {}`", tracker_path(name));
+    for fork in definitions {
+        let name = tracker_path(&fork.name);
+        if let Some(from) = &fork.from {
+            let up = tracker_path(from);
+            // Follow `from` up: a chain that comes back to this fork never
+            // reaches a history of its own.
+            let mut at = from.clone();
+            let mut cycle = false;
+            for _ in 0..=definitions.len() {
+                if at == fork.name {
+                    cycle = true;
+                    break;
+                }
+                match find(&at).and_then(|next| next.from.clone()) {
+                    Some(next) => at = next,
+                    None => break,
+                }
+            }
+            if cycle {
+                problems.push((
+                    fork.name.clone(),
+                    format!(
+                        "it is a fork of `{up}` (`from`), and following `from` comes back to \
+                         `{name}`: a fork starts at another tracker's history, so two can't be \
+                         forks of each other. Fix `from` in `{name}`'s definition, or {}",
+                        remove(&fork.name)
+                    ),
+                ));
+                continue;
+            }
+            match find(from) {
+                None => problems.push((
+                    fork.name.clone(),
+                    format!(
+                        "it is a fork of `{up}` (`from`), which is not defined, and `{up}`'s \
+                         audience is the ceiling on `{name}`'s. Restore `{up}`'s definition \
+                         (`git checkout -- .newgit/trackers/{up}.toml` if it was deleted), or {}",
+                        remove(&fork.name)
+                    ),
+                )),
+                Some(upstream) if !audience_within(&fork.audience, &upstream.audience) => {
+                    problems.push((
+                        fork.name.clone(),
+                        format!(
+                            "its audience `{}` is wider than `{up}`'s `{}`, and it is a fork of \
+                             `{up}` (`from`): its history holds `{up}`'s, so it may be read by \
+                             no one `{up}` is not. Set `audience = \"{}\"` (or a narrower one) \
+                             in `{name}`'s definition, or {}",
+                            fork.audience,
+                            upstream.audience,
+                            upstream.audience,
+                            remove(&fork.name)
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for was in earlier.iter().filter(|was| was.fork == fork.name) {
+            if fork.from.as_deref() == Some(was.upstream.as_str())
+                || !seen.insert(was.upstream.clone())
+            {
+                continue;
+            }
+            let up = tracker_path(&was.upstream);
+            let ceiling = find(&was.upstream)
+                .map(|upstream| upstream.audience.clone())
+                .or_else(|| was.audience.clone());
+            let now = match &fork.from {
+                Some(from) => format!("now says `from = \"{}\"`", tracker_path(from)),
+                None => "no longer says `from`".to_owned(),
+            };
+            let why = match ceiling {
+                Some(ceiling) if audience_within(&fork.audience, &ceiling) => continue,
+                Some(ceiling) => format!(
+                    "it was a fork of `{up}` and its definition {now}, but its history still \
+                     holds `{up}`'s, so its audience can't be wider than `{up}`'s `{ceiling}`, \
+                     and `{}` is. Put back `from = \"{up}\"` with an audience of `{ceiling}` or \
+                     narrower. A fork is never detached: to share something more widely, make a \
+                     new tracker (`newgit tracker create <name>`) and capture into it only what \
+                     may be shared",
+                    fork.audience
+                ),
+                None => format!(
+                    "it was a fork of `{up}` and its definition {now}, but its history still \
+                     holds `{up}`'s, and `{up}` is not defined, so its ceiling can't be checked. \
+                     Restore `{up}`'s definition and put back `from = \"{up}\"`, or {}",
+                    remove(&fork.name)
+                ),
+            };
+            problems.push((fork.name.clone(), why));
+        }
+    }
+    problems
+}
+
+/// [`fork_problems`], refusing the first.
+pub fn check_forks(definitions: &[TrackerDefinition], earlier: &[EarlierFork]) -> Result<()> {
+    match fork_problems(definitions, earlier).into_iter().next() {
+        None => Ok(()),
+        Some((name, reason)) => Err(NewgitError::InvalidDefinition {
+            kind: "tracker",
+            name: tracker_path(&name),
+            reason,
+        }),
+    }
+}
+
+/// Settle who owns what across every tracker. A path's owner is decided by
+/// [`owners_of`], so trackers may nest — `apps` can hold `apps/electron`
+/// for another tracker — but no two may claim the identical path (role
+/// alternatives aside), and only one may own `.`. Fills in each
+/// definition's `ownership`, which [`TrackerDefinition::owns`] reads, and
+/// `excluded` (paths inside its own it does not own). Forks are checked apart
+/// ([`fork_problems`]): a fork that needs fixing must not stop the commands
+/// that fix it.
 pub fn resolve_ownership(definitions: &mut [TrackerDefinition]) -> Result<()> {
     let roots: Vec<&str> = definitions
         .iter()
@@ -807,51 +1175,43 @@ pub fn resolve_ownership(definitions: &mut [TrackerDefinition]) -> Result<()> {
             }
         }
     }
-    let claims: Vec<(String, Utf8PathBuf)> = definitions
-        .iter()
-        .flat_map(|definition| {
+    // Every path where `owners_of` can change its answer: the decision
+    // for any path is the decision for the longest of these holding it, so
+    // deciding each one once is deciding every path.
+    let mut decisive: Vec<Utf8PathBuf> = std::iter::once(Utf8PathBuf::from("."))
+        .chain(definitions.iter().flat_map(|definition| {
             definition
                 .paths
                 .iter()
-                .map(|path| (definition.name.clone(), path.clone()))
+                .chain(&definition.exclusions)
+                .cloned()
+                .chain(definition.mounted().then(|| definition.mount.clone()))
+        }))
+        .collect();
+    decisive.sort();
+    decisive.dedup();
+    let settled: Vec<Vec<(Utf8PathBuf, bool)>> = definitions
+        .iter()
+        .map(|definition| {
+            decisive
+                .iter()
+                .filter(|prefix| definition.paths.iter().any(|claim| under(prefix, claim)))
+                .map(|prefix| {
+                    let owned = owners_of(definitions, prefix)
+                        .iter()
+                        .any(|owner| std::ptr::eq(*owner, definition));
+                    (prefix.clone(), owned)
+                })
+                .collect()
         })
         .collect();
-    // A tracker mounted deeper takes its whole mount, whatever it claims
-    // there: a parent's claim does not reach into a mount.
-    let mounts: Vec<(String, Utf8PathBuf)> = definitions
-        .iter()
-        .filter(|definition| definition.mounted())
-        .map(|definition| (definition.name.clone(), definition.mount.clone()))
-        .collect();
-    for definition in definitions.iter_mut() {
-        let own_depth = mount_depth(&definition.mount);
-        let inside = |inner: &Utf8Path, outer: &Utf8PathBuf| {
-            outer.as_str() == "." || (inner != outer && inner.starts_with(outer))
-        };
-        definition.excluded = claims
+    for (definition, ownership) in definitions.iter_mut().zip(settled) {
+        definition.excluded = ownership
             .iter()
-            .filter(|(name, inner)| {
-                name != &definition.name
-                    && inner.as_str() != "."
-                    && definition.paths.iter().any(|outer| inside(inner, outer))
-            })
-            .map(|(_, inner)| inner.clone())
-            .chain(
-                mounts
-                    .iter()
-                    .filter(|(name, mount)| {
-                        name != &definition.name
-                            && mount_depth(mount) > own_depth
-                            && definition
-                                .paths
-                                .iter()
-                                .any(|outer| outer.as_str() == "." || mount.starts_with(outer))
-                    })
-                    .map(|(_, mount)| mount.clone()),
-            )
+            .filter(|(_, owned)| !owned)
+            .map(|(prefix, _)| prefix.clone())
             .collect();
-        definition.excluded.sort();
-        definition.excluded.dedup();
+        definition.ownership = ownership;
     }
     Ok(())
 }
@@ -946,12 +1306,7 @@ pub fn collect_owned_files(
     definition: &TrackerDefinition,
 ) -> Result<Vec<(Utf8PathBuf, Utf8PathBuf)>> {
     let mut files = collect_files(workspace, &definition.paths)?;
-    files.retain(|(relative, _)| {
-        !definition
-            .excluded
-            .iter()
-            .any(|inner| relative.starts_with(inner))
-    });
+    files.retain(|(relative, _)| definition.owns(relative));
     Ok(files)
 }
 
@@ -1074,10 +1429,12 @@ mod tests {
             priority: 0,
             pinned: false,
             link: None,
+            from: None,
             requires: Vec::new(),
             resources: Vec::new(),
             export: Vec::new(),
             excluded: Vec::new(),
+            ownership: Vec::new(),
             parent: None,
             definition_rev: "sha256:000000000000".to_owned(),
         }

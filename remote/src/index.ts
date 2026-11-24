@@ -335,6 +335,10 @@ export async function handle(request: Request, env: Env, deps: Deps): Promise<Re
 	}
 }
 
+// Every user agent, every path. An empty `Disallow:` is the oldest spelling
+// of "allow everything", so crawlers that predate `Allow:` read it too.
+const ROBOTS_TXT = "User-agent: *\nAllow: /\nDisallow:\n";
+
 async function route(request: Request, env: Env, deps: Deps): Promise<Response> {
 	const url = new URL(request.url);
 	const path = url.pathname.replace(/\/+$/, "");
@@ -344,6 +348,14 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	if ((method === "GET" || method === "HEAD") && (path === "/install.sh" || path === "/install"))
 		return new Response(method === "HEAD" ? null : installScript, {
 			headers: { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300" },
+		});
+
+	// ── robots.txt: anything may index or scrape anything ──────────────────
+	// The site, the docs, and public projects are meant to be read, by people
+	// and by agents alike. Private routes are guarded by auth, not by this file.
+	if ((method === "GET" || method === "HEAD") && path === "/robots.txt")
+		return new Response(method === "HEAD" ? null : ROBOTS_TXT, {
+			headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "public, max-age=3600" },
 		});
 
 	// ── The site: the landing page and the wiki ────────────────────────────
@@ -682,23 +694,23 @@ async function route(request: Request, env: Env, deps: Deps): Promise<Response> 
 	// What is not written down yet, read without rolling it up: what
 	// `newgit status` says.
 	if (method === "GET" && rest === "/state") {
-		const report = await project.report();
 		// A pinned tracker's own `main` moved on past the pin its parent
 		// holds: said, so held still never reads as forgotten. (On a branch
-		// its head is the pin: moving it is a change to the parent.)
-		const listed = await listedTrackers(project);
-		const pinned: string[] = [];
-		for (const tracker of listed)
-			if ((await definitionFacts(deps.repos, id, tracker, listed))?.pinned === true) pinned.push(tracker);
-		const mains = new Map<string, string | null>();
-		for (const tracker of pinned)
-			mains.set(
-				tracker,
-				await deps.repos
-					.branchHead(namer(tracker), "main")
-					.catch(() => null),
-			);
-		const branches = await project.branches();
+		// its head is the pin: moving it is a change to the parent.) Asked
+		// together, not one round trip after another, and every tracker's
+		// definition read in one go rather than once per tracker.
+		const [report, branches] = await Promise.all([project.report(), project.branches()]);
+		const listed = [...new Set(branches.flatMap((branch) => Object.keys(branch.list)))];
+		const facts = await loadDefinitions(deps.repos, id, listed);
+		const pinned = listed.filter((tracker) => facts.get(tracker)?.pinned === true);
+		const mains = new Map<string, string | null>(
+			await Promise.all(
+				pinned.map(
+					async (tracker) =>
+						[tracker, await deps.repos.branchHead(namer(tracker), "main").catch(() => null)] as const,
+				),
+			),
+		);
 		return json({
 			...report,
 			branches: report.branches.map((state) => {
@@ -1674,10 +1686,13 @@ function claimOn(facts: TrackerFacts, path: string): number | undefined {
 
 /**
  * The tracker in Git owning workspace `path`, by the ownership rules
- * (docs/design/trackers.md, *Ownership*), as the client's `owner_of` decides it:
- * the deepest mount holding the path decides, a parent's claim not reaching
- * into it; among the trackers mounted there the longest claim wins, ties to
- * the lesser name; a path every claim there excludes is owned by nothing.
+ * (docs/design/trackers.md, *Ownership*), as the client's `owners_of` decides
+ * it among trackers in Git: a claim of a tracker in Git never reaches into a
+ * deeper mount, so the deepest mount holding the path decides; among the
+ * trackers mounted there the longest claim wins, ties to the lesser name; a
+ * path every claim there excludes is owned by nothing. Asked only of
+ * definition files under `.newgit/trackers/`, where no tracker outside Git
+ * may be mounted.
  */
 function ownerOf(facts: Map<string, TrackerFacts>, path: string): string | undefined {
 	const depth = (mount: string) => (mount === "." ? 0 : mount.split("/").length);

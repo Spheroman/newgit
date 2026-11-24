@@ -68,6 +68,24 @@ pub struct BranchInstance {
     /// embargo, for work the rest of the project must not see yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub private: bool,
+    /// The checkpoint this instance's workspace was evicted to (`newgit stop
+    /// --evict`): the workspace is gone, all but its marker, and `newgit
+    /// start` brings it back from this checkpoint at the same path. `None`
+    /// while the workspace is there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted: Option<String>,
+    /// The checkpoint `newgit remove` took of the workspace just before it
+    /// deleted it. Set only on an archived record: what `newgit spawn
+    /// --from-checkpoint <instance>/<id>` brings back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_to: Option<String>,
+    /// Directories beside the workspace holding what was at its path when a
+    /// restore of it was cut short or failed (`.<name>.interrupted-restore`,
+    /// `.<name>.restore-failed`): work no checkpoint holds. newgit never
+    /// deletes one on its own; `newgit cleanup --discard-saved <path>` does,
+    /// when asked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saved_copies: Vec<Utf8PathBuf>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -120,6 +138,20 @@ pub struct ResourceBinding {
     /// `render_error`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_error: Option<String>,
+    /// Why this resource's restore failed in the last undo, when it did; as
+    /// `render_error`. A failed restore is retried by another undo, not by
+    /// the action that starts its process, which would serve whatever the
+    /// restore left half done. Cleared when a restore or its `prepare`
+    /// succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_error: Option<String>,
+    /// [`crate::resource::ResourceDefinition::prepare_rev`] of the `prepare`
+    /// this binding last ran, so `status` can say when the definition's has
+    /// changed since (#85). A parked resource brought back through `resume`
+    /// keeps the one it had: `resume` is not `prepare`. `None` in a record
+    /// written before this was kept, which `status` takes as unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepare_rev: Option<String>,
 }
 
 /// A binding a tracker drop set aside: the binding as it was, and how far
@@ -212,6 +244,9 @@ impl BranchInstance {
             dropped: Default::default(),
             parked: BTreeMap::new(),
             private: false,
+            evicted: None,
+            removed_to: None,
+            saved_copies: Vec::new(),
             created_at: now,
             remote: None,
             updated_at: now,

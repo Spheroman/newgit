@@ -36,6 +36,7 @@ impl Spawned {
 /// `review`, spawned from `feature-a/ckpt_001` with `--json`, its stdout
 /// parsed as the one JSON document it must be.
 fn spawn_review(fixture: &Fixture) -> Spawned {
+    only_on_the_remote(fixture, "feature-a");
     let output = fixture.newgit(
         &fixture.store,
         &[

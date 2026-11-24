@@ -1,0 +1,10 @@
+ownership = "user"
+
+[identity]
+paths = ["apps/t3code/pnpm-lock.yaml"]
+
+[checkpoint]
+mode = "hash"
+
+[restore]
+mode = "none"

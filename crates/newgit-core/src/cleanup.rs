@@ -32,6 +32,14 @@ pub struct CleanupOutcome {
     /// Checkpoint logs discarded because their instance is archived and the
     /// caller asked for it. Empty unless purging was requested.
     pub purged_checkpoints: Vec<PurgedCheckpoints>,
+    /// Checkpoints retention collected (#446): `evict` checkpoints a later
+    /// eviction superseded, and those a restore that succeeded took on its
+    /// way ([`crate::checkpoint::superseded`]).
+    pub collected_checkpoints: Vec<CollectedCheckpoint>,
+    /// What the store's objects reached only by `collected_checkpoints` take
+    /// on disk, by `git rev-list --disk-usage`: what Git frees once they are
+    /// older than its grace period.
+    pub collected_bytes: u64,
     pub pruned: Vec<PrunedRev>,
     /// Install-store entries no live instance keys to any more — the trees
     /// of lockfiles that have since moved on.
@@ -53,6 +61,7 @@ impl CleanupOutcome {
             && self.retired_pids.is_empty()
             && self.dead_state.is_empty()
             && self.purged_checkpoints.is_empty()
+            && self.collected_checkpoints.is_empty()
             && self.pruned.is_empty()
             && self.pruned_installs.is_empty()
     }
@@ -87,6 +96,20 @@ pub struct PurgedCheckpoints {
     /// Store refs the checkpoints held (`refs/newgit/checkpoints/<slug>/*`).
     pub source_refs: usize,
     pub dir: Utf8PathBuf,
+}
+
+/// One checkpoint retention collected: its record and the store ref that
+/// held its source are deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedCheckpoint {
+    /// The instance's slug: the name its history is kept under, which
+    /// outlives an archived record.
+    pub slug: String,
+    pub id: String,
+    pub reason: crate::checkpoint::CheckpointReason,
+    /// For one a restore took: the evict checkpoint that restore brought
+    /// back.
+    pub restore_of: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +148,10 @@ pub enum HookDetail {
         command: String,
         placeholder: String,
     },
+    /// Not run: the checkpoint `remove` took first could not capture the
+    /// resource, so its state is in no checkpoint, and running this (a
+    /// `dropdb`, say) would delete it. `remove --force` runs it.
+    SkippedUncaptured(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +203,18 @@ impl SnapshotRoots {
         branches: &[BranchInstance],
         archived: ArchivedCheckpoints,
     ) -> Result<Self> {
+        Self::collect_except(store, branches, archived, &BTreeSet::new())
+    }
+
+    /// [`Self::collect`], leaving out the checkpoints in `collected` (`(slug,
+    /// id)`), which retention drops in the same pass: what makes a dry run
+    /// report the revs the real run releases.
+    pub fn collect_except(
+        store: &MetadataStore,
+        branches: &[BranchInstance],
+        archived: ArchivedCheckpoints,
+        collected: &BTreeSet<(String, String)>,
+    ) -> Result<Self> {
         let mut roots = Self::default();
 
         for branch in branches {
@@ -200,6 +239,9 @@ impl SnapshotRoots {
             };
             let log = CheckpointLog::new(store.checkpoint_dir(&slug), &slug);
             for record in log.list()? {
+                if collected.contains(&(slug.clone(), record.id.clone())) {
+                    continue;
+                }
                 for state in &record.tracker_states {
                     if let Some(rev) = &state.content_rev {
                         claims.insert((state.name.clone(), rev.clone()));
@@ -308,6 +350,11 @@ pub fn orphan_workspaces(
             }
             continue;
         }
+        // What a restore that was cut short or failed kept of the user's
+        // work: never an orphan, whatever is in it.
+        if dir.file_name().is_some_and(is_saved_copy_name) {
+            continue;
+        }
         if workspace_marker_path(&dir).is_file() || is_empty_dir(&dir)? {
             orphans.push(dir);
         } else {
@@ -318,6 +365,25 @@ pub fn orphan_workspaces(
         }
     }
     Ok((orphans, warnings))
+}
+
+/// Whether a directory name under the workspace root is a saved copy a
+/// restore made (`.<name>.interrupted-restore`, `.<name>.restore-failed`,
+/// with `-2`, `-3`, … after a second one).
+pub fn is_saved_copy_name(name: &str) -> bool {
+    name.starts_with('.')
+        && [".interrupted-restore", ".restore-failed"]
+            .iter()
+            .any(|what| match name.find(what) {
+                Some(at) => {
+                    let rest = &name[at + what.len()..];
+                    rest.is_empty()
+                        || rest
+                            .strip_prefix('-')
+                            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                }
+                None => false,
+            })
 }
 
 fn is_empty_dir(path: &Utf8Path) -> Result<bool> {

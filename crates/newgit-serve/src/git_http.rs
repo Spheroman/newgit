@@ -2,10 +2,11 @@
 //!
 //! Two kinds of URL:
 //!
-//! - `/_git/<repo>.git/…`: one tracker's repo (or an instance's fork of it, a
-//!   namespace inside it), as `remote`s in credentials name it. The password
-//!   is the caller's newgit token; every request is checked against the rules
-//!   when it arrives.
+//! - `/_git/<repo>.git/…`: one tracker's repo (or an instance's fork of it),
+//!   as `remote`s in credentials name it: a Git namespace in its audience's
+//!   store, served with `git --namespace`. The password is the caller's
+//!   newgit token; every request is checked against the rules when it
+//!   arrives.
 //! - `/<owner>/<name>[/<path>].git/…`: the project's Git endpoint. Each
 //!   reader's view is composed from the trackers they may read
 //!   (`newgit_core::endpoint::compose_view`), then served. Read-only.
@@ -30,7 +31,7 @@ use crate::App;
 use crate::api::{self, Caller, ProjectContext};
 use crate::db;
 use crate::error::{ApiResult, HttpError, fail};
-use crate::names::{self, ProjectId, RepoRef, parse_project_key, parse_repo_name, within};
+use crate::names::{ProjectId, RepoRef, parse_project_key, parse_repo_name, within};
 use crate::policy::{self, Context};
 
 /// The most a gzipped request body may inflate to. Git gzips only
@@ -122,8 +123,25 @@ struct Run {
     namespace: Option<String>,
     /// Ref prefixes a push may touch; empty for any the namespace allows.
     allowed: Vec<String>,
-    /// Hide other instances' namespaces from a tracker's own readers.
-    hide_namespaces: bool,
+    /// A tracker's own refs, not a fork's: instances' namespaces inside it
+    /// are hidden from its readers, and a push to it may move a `main`.
+    tracker: bool,
+    /// A push into a store, counted while it runs: a tracker moving out of
+    /// that store waits for it before removing what it had there.
+    pushing: Option<crate::landing::Pushing>,
+}
+
+impl Run {
+    /// `repo`, the API's `named`, as its namespace in its store.
+    fn repo(named: &RepoRef, repo: &crate::repos::Repo, allowed: Vec<String>) -> Self {
+        Self {
+            git_dir: repo.dir(),
+            namespace: Some(repo.namespace.clone()),
+            allowed,
+            tracker: !matches!(named, RepoRef::Fork { .. }),
+            pushing: None,
+        }
+    }
 }
 
 // ── A tracker's repo ──────────────────────────────────────────────────────
@@ -147,9 +165,11 @@ pub async fn repo(app: Arc<App>, request: Request<Body>) -> Response<Body> {
     };
     let name = name.to_owned();
     let write = ask.service == Service::Receive;
+    let pushes = write && !ask.advertise;
     let decided = {
         let app = app.clone();
-        tokio::task::spawn_blocking(move || authorize_repo(&app, &token, &name, write)).await
+        tokio::task::spawn_blocking(move || authorize_repo(&app, &token, &name, write, pushes))
+            .await
     };
     let run = match decided {
         Ok(Ok(run)) => run,
@@ -159,7 +179,16 @@ pub async fn repo(app: Arc<App>, request: Request<Body>) -> Response<Body> {
     run_git(app, run, ask, request).await
 }
 
-fn authorize_repo(app: &App, token: &str, name: &str, write: bool) -> ApiResult<Run> {
+/// What `name` is to the caller `token` names, and where Git runs for it.
+/// `pushes`: this is the push itself (not its advertisement), counted while
+/// it runs.
+fn authorize_repo(
+    app: &Arc<App>,
+    token: &str,
+    name: &str,
+    write: bool,
+    pushes: bool,
+) -> ApiResult<Run> {
     let db = app.db.lock();
     let caller = api::caller_for(app, &db, token)?;
     let Some(repo) = parse_repo_name(name) else {
@@ -178,8 +207,10 @@ fn authorize_repo(app: &App, token: &str, name: &str, write: bool) -> ApiResult<
     {
         let granted = db::granted(&db, &repo.name(), &caller.token_id)?;
         if !granted.is_empty() {
-            let location = names::locate(&app.config.data, &repo, false);
-            if !crate::repos::exists(&location.git_dir) {
+            // A seed: alone in its own store, so nothing else is reachable.
+            let facts = project.facts(&db, repo.tracker_name())?;
+            let location = project.served(&db, &repo, facts.as_ref(), false)?;
+            if !location.exists() {
                 return fail(404, format!("{} does not exist", repo.name()));
             }
             let allowed = if granted.iter().any(|refs| refs == "*") {
@@ -187,22 +218,58 @@ fn authorize_repo(app: &App, token: &str, name: &str, write: bool) -> ApiResult<
             } else {
                 granted
             };
-            return Ok(Run {
-                git_dir: location.git_dir,
-                hide_namespaces: location.namespace.is_none(),
-                namespace: location.namespace,
-                allowed,
-            });
+            let mut run = Run::repo(&repo, &location, allowed);
+            if pushes {
+                run.pushing = Some(counted(app, &repo, &location));
+            }
+            return Ok(run);
         }
     }
-    let location = api::authorize(&project, &db, &caller, &repo, write)?;
-    Ok(Run {
-        git_dir: location.git_dir,
-        hide_namespaces: location.namespace.is_none(),
-        namespace: location.namespace,
-        allowed: Vec::new(),
-    })
+    // A merge's commits, pushed with the password `begin` handed out: into
+    // the merger's landing for this repo, never the store, until the merge
+    // lands and says which store they belong in (`Repo::landing_dir`).
+    if write
+        && matches!(&repo, RepoRef::Tracker { tracker, login: None, .. } if listed.contains(tracker))
+        && db::granted(&db, &repo.name(), &caller.token_id)?
+            .iter()
+            .any(|refs| refs == LANDING)
+    {
+        let (location, _db) =
+            api::authorize(&project, &db, &caller, &repo, false)?.made(app, db)?;
+        return Ok(Run {
+            git_dir: location.open_landing(&caller.login)?,
+            namespace: None,
+            allowed: vec![LANDING.to_owned()],
+            tracker: false,
+            pushing: None,
+        });
+    }
+    let authorized = api::authorize(&project, &db, &caller, &repo, write)?;
+    let (location, _db) = authorized.made(app, db)?;
+    let mut run = Run::repo(&repo, &location, Vec::new());
+    if pushes {
+        // Under the db lock, where the store was decided.
+        run.pushing = Some(counted(app, &repo, &location));
+    }
+    Ok(run)
 }
+
+/// A push into `location`, which is `repo`, counted while it runs.
+fn counted(
+    app: &Arc<App>,
+    repo: &RepoRef,
+    location: &crate::repos::Repo,
+) -> crate::landing::Pushing {
+    crate::landing::Pushes::start(
+        app,
+        &repo.project().key(),
+        repo.tracker_name(),
+        &location.store.name(),
+    )
+}
+
+/// The refs a merge's landing password may push.
+pub const LANDING: &str = "refs/newgit/landing/";
 
 // ── The Git endpoint ──────────────────────────────────────────────────────
 
@@ -231,7 +298,7 @@ pub async fn endpoint(app: Arc<App>, request: Request<Body>) -> Response<Body> {
         let app = app.clone();
         tokio::task::spawn_blocking(move || plan_view(&app, &token, &parts)).await
     };
-    let (id, plan) = match decided {
+    let (id, plan, stored) = match decided {
         Ok(Ok(planned)) => planned,
         Ok(Err(error)) => return refused(&error),
         Err(error) => return refused(&HttpError::internal(error)),
@@ -239,6 +306,46 @@ pub async fn endpoint(app: Arc<App>, request: Request<Body>) -> Response<Body> {
     // One composition at a time per project: they share its stores.
     let lock = app.compose_lock(&id.key());
     let _held = lock.lock().await;
+    if let Some(want) = stored {
+        // The stored rooted history, checked where it is and brought up to
+        // the lists just read, all after the db lock is let go of. A stored
+        // history never moves back to older lists (`rooted::refresh`), so
+        // once this returns its refs are at least as new as the lists this
+        // read, whatever writes it after: upload-pack reads no older view.
+        let refreshed = {
+            let (mut want, id) = (want.clone(), id.clone());
+            tokio::task::spawn_blocking(move || {
+                if !crate::rooted::located(&mut want, &id)? {
+                    return Ok(None);
+                }
+                crate::rooted::refresh(&want).map(|done| (!done.gone).then_some(want))
+            })
+            .await
+        };
+        match refreshed {
+            Ok(Ok(Some(want))) => {
+                drop(_held);
+                let run = Run {
+                    git_dir: want.dir(),
+                    namespace: Some(crate::rooted::namespace(&want.tracker)),
+                    allowed: Vec::new(),
+                    tracker: false,
+                    pushing: None,
+                };
+                return run_git(app, run, ask, request).await;
+            }
+            // Not where its lists said by the time it was checked (a move
+            // landed meanwhile): composed for this fetch, as before.
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => eprintln!(
+                "newgit serve: `{}`'s rooted history in {}: {}; composing it for this fetch",
+                want.tracker,
+                id.key(),
+                error.cause()
+            ),
+            Err(error) => eprintln!("newgit serve: rooted history: {error}"),
+        }
+    }
     let composed =
         tokio::task::spawn_blocking(move || newgit_core::endpoint::compose_view(&plan)).await;
     let view = match composed {
@@ -257,7 +364,8 @@ pub async fn endpoint(app: Arc<App>, request: Request<Body>) -> Response<Body> {
         git_dir: view,
         namespace: None,
         allowed: Vec::new(),
-        hide_namespaces: false,
+        tracker: false,
+        pushing: None,
     };
     run_git(app, run, ask, request).await
 }
@@ -265,11 +373,15 @@ pub async fn endpoint(app: Arc<App>, request: Request<Body>) -> Response<Body> {
 /// The view `token`'s caller may read of the project `parts` names, as a plan
 /// for the composer: each branch and tag cut down to the trackers in Git
 /// they may read, rooted at the tracker the path names.
-fn plan_view(
-    app: &App,
-    token: &str,
-    parts: &[String],
-) -> ApiResult<(ProjectId, newgit_core::endpoint::Plan)> {
+/// A view as the composer would make it, and the stored rooted history that
+/// is exactly it, when there is one (`rooted`).
+type Planned = (
+    ProjectId,
+    newgit_core::endpoint::Plan,
+    Option<crate::rooted::Want>,
+);
+
+fn plan_view(app: &App, token: &str, parts: &[String]) -> ApiResult<Planned> {
     let db = app.db.lock();
     let caller = api::caller_for(app, &db, token)?;
     let (Some(owner), Some(name)) = (parts.first(), parts.get(1)) else {
@@ -280,7 +392,42 @@ fn plan_view(
     };
     let project = ProjectContext::load(app, &db, &caller, &id)?;
     let plan = view_plan(app, &db, &project, &caller, &parts[2..])?;
-    Ok((id, plan))
+    let stored = stored_view(&db, &project, &plan)?;
+    Ok((id, plan, stored))
+}
+
+/// The stored rooted history of `plan`'s root, when it is exactly the view
+/// `plan` asks for: every branch and tag, each composed from the same
+/// trackers. A reader who may read more than the root's store's audience
+/// (a private tracker mounted inside) is composed for, per fetch.
+/// `NEWGIT_SERVE_ROOTED=off` composes for everyone, as before stored
+/// histories: the tests compare the two.
+fn stored_view(
+    db: &Connection,
+    project: &ProjectContext<'_>,
+    plan: &newgit_core::endpoint::Plan,
+) -> ApiResult<Option<crate::rooted::Want>> {
+    if std::env::var("NEWGIT_SERVE_ROOTED").is_ok_and(|value| value == "off") {
+        return Ok(None);
+    }
+    let Some(want) = crate::rooted::wanted(project, db, &plan.root)? else {
+        return Ok(None);
+    };
+    let same = |cut: &BTreeMap<String, String>, part: &crate::rooted::Part| {
+        cut.get(&plan.root) == Some(&part.source) && cut.keys().eq(part.set.iter())
+    };
+    let heads = plan.branches.len() == want.heads.len()
+        && plan
+            .branches
+            .iter()
+            .all(|(name, cut)| want.heads.get(name).is_some_and(|part| same(cut, part)));
+    let tags = plan.tags.len() == want.tags.len()
+        && plan.tags.iter().all(|(name, tag)| {
+            want.tags
+                .get(name)
+                .is_some_and(|part| same(&tag.list, part) && part.annotation == tag.annotation)
+        });
+    Ok((heads && tags && plan.default_branch == want.default_branch).then_some(want))
 }
 
 fn view_plan(
@@ -390,12 +537,14 @@ fn view_plan(
     let repos = needed
         .iter()
         .map(|tracker| {
+            let repo = project.tracker(tracker);
             (
                 tracker.clone(),
                 newgit_core::endpoint::Source {
-                    url: project.tracker_dir(tracker).to_string(),
+                    url: repo.dir().to_string(),
                     // Local repos: Git sends no header to a path.
                     auth: "Authorization: Basic eDp4".to_owned(),
+                    namespace: Some(repo.namespace),
                 },
             )
         })
@@ -464,11 +613,18 @@ async fn run_git(app: Arc<App>, run: Run, ask: Ask, request: Request<Body>) -> R
     let Ok(permit) = app.git_slots.clone().acquire_owned().await else {
         return text(503, "the remote is shutting down");
     };
-    let mut command = tokio::process::Command::new("git");
+    let mut command = tokio::process::Command::from(newgit_core::git::command());
     command
         .arg("-c")
         .arg(format!("core.hooksPath={}", app.hooks_dir()));
-    if run.hide_namespaces {
+    // A fork's record of what it was made from is the server's alone: hidden
+    // from every request, so no push can move or delete it (receive-pack
+    // refuses to update a hidden ref). Matched with the namespace stripped.
+    command
+        .arg("-c")
+        .arg(format!("transfer.hideRefs={}", crate::repos::FORK_RECORD));
+    if run.tracker {
+        // Matched with the namespace stripped: the forks inside this one.
         command.arg("-c").arg("transfer.hideRefs=refs/namespaces/");
     }
     if let Some(namespace) = &run.namespace {
@@ -488,10 +644,10 @@ async fn run_git(app: Arc<App>, run: Run, ask: Ask, request: Request<Body>) -> R
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // A push to a repo's own refs (not a fork's namespace) may move a `main`
-    // that definitions are read from.
-    let moves_trackers =
-        ask.service == Service::Receive && !ask.advertise && run.namespace.is_none();
+    // A push to a tracker's own refs (not a fork's) may move a `main` that
+    // definitions are read from.
+    let moves_trackers = ask.service == Service::Receive && !ask.advertise && run.tracker;
+    let pushing = run.pushing;
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return refused(&HttpError::internal(error)),
@@ -521,6 +677,7 @@ async fn run_git(app: Arc<App>, run: Run, ask: Ask, request: Request<Body>) -> R
             let mut text = String::new();
             let _ = stderr.read_to_string(&mut text).await;
             let _ = child.wait().await;
+            drop(pushing);
             drop(permit);
             if moves_trackers {
                 app.trackers_moved();

@@ -1,0 +1,35 @@
+# HOST TOOLS: your package manager, plus whatever `key_command` runs. Note
+# that `key_command` ships as `node -v && uname -sm` — correct for a Node
+# project and wrong for a uv or Cargo one, where it should ask *your*
+# toolchain its version. It is an EDIT ME in everything but name.
+#
+# A generic starter: every package manager needs the same shape (install
+# from a lockfile into a tree), so this template parameterizes nothing and
+# marks the two lines that are actually yours to fill in. `pnpm` is the
+# worked example — `newgit resource templates --show pnpm` — and also wires
+# up a shared, content-addressed store; see "Installs: use a
+# content-addressed store" in the reference for what that saves and what it
+# costs to skip.
+ownership = "workspace"
+depends_on = []
+
+[identity]
+paths = ["remote/package.json", "remote/package-lock.json"]
+# The tree `prepare` builds. A monorepo installing into several places
+# names each one: paths are literal, and a directory means all of it.
+produces = ["remote/node_modules"]
+# What the lockfile cannot see. Its hash says what was asked for, not what
+# gets built — install scripts compile against this platform and this Node.
+key_command = "node -v && uname -sm"
+
+[actions.prepare]
+command = "npm ci --prefix remote --no-audit --no-fund"
+
+# Hashes `[identity] paths` above: what the install is derived from is
+# declared once, and a `recompute` restore skips when it has not moved.
+[checkpoint]
+mode = "hash"
+
+[restore]
+mode = "recompute"
+action = "prepare"

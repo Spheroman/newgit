@@ -14,6 +14,7 @@
 
 - [T3 Code](t3-code.md)
 - [Claude Code](claude-code.md)
+- [Codex](codex.md)
 
 **Working on newgit**
 

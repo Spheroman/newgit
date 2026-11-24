@@ -8,22 +8,26 @@ use std::net::{TcpListener, UdpSocket};
 
 use newgit_core::ports::bindable;
 
-/// Ask the OS for an ephemeral TCP port by binding port 0, so this test
-/// can't collide with anything a developer happens to have running.
-fn free_tcp_port() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr").port()
-}
-
 /// A port nothing is using should be reported bindable across the board.
+///
+/// A port the OS handed out and was given back is free only until anything
+/// else on the machine takes it, a client socket included, so this asks
+/// for a few and needs one reported bindable. A probe that never reports a
+/// free port still fails.
 #[test]
 fn free_port_is_bindable() {
-    let port = free_tcp_port();
-    // Dropping the listener that reserved `port` releases it immediately,
-    // so by the time `bindable` runs the port is free again.
+    let ports: Vec<u16> = (0..5)
+        .map(|_| {
+            TcpListener::bind(("127.0.0.1", 0))
+                .expect("bind ephemeral port")
+                .local_addr()
+                .expect("local_addr")
+                .port()
+        })
+        .collect();
     assert!(
-        bindable(port),
-        "port {port} was never claimed by anything and should be bindable"
+        ports.iter().any(|port| bindable(*port)),
+        "none of {ports:?} was claimed by anything for long, and one should be bindable"
     );
 }
 
@@ -35,11 +39,10 @@ fn free_port_is_bindable() {
 /// `SO_REUSEADDR`, sails past.
 #[test]
 fn port_held_on_ipv4_wildcard_is_not_bindable() {
-    let port = free_tcp_port();
-    // Rebinding the same port immediately after freeing it is inherently a
-    // little racy on a busy machine; in practice the window is far too
-    // short for anything else to have grabbed it.
-    let held = TcpListener::bind(("0.0.0.0", port)).expect("bind wildcard port");
+    // Held from the moment the OS picks it: a port picked, given back and
+    // bound again could be taken in between.
+    let held = TcpListener::bind(("0.0.0.0", 0)).expect("bind wildcard port");
+    let port = held.local_addr().expect("local_addr").port();
 
     assert!(
         !bindable(port),
@@ -47,10 +50,27 @@ fn port_held_on_ipv4_wildcard_is_not_bindable() {
     );
 
     drop(held);
-    assert!(
-        bindable(port),
-        "port {port} should be bindable again once the wildcard listener is dropped"
-    );
+}
+
+/// A listener dropped frees its port, so the probe reports it bindable
+/// again, for the wildcard and loopback holders alike. A port given back is
+/// free only until anything else takes it, so this holds a few in turn and
+/// needs one reported bindable after it is let go.
+#[test]
+fn a_port_is_bindable_again_once_its_listener_is_dropped() {
+    for address in ["0.0.0.0", "127.0.0.1"] {
+        let freed = (0..5).any(|_| {
+            let held = TcpListener::bind((address, 0)).expect("bind ephemeral port");
+            let port = held.local_addr().expect("local_addr").port();
+            assert!(!bindable(port), "port {port} is held on {address}");
+            drop(held);
+            bindable(port)
+        });
+        assert!(
+            freed,
+            "no port held on {address} was bindable once its listener was dropped"
+        );
+    }
 }
 
 /// Same conflict, but held on loopback specifically rather than the
@@ -59,16 +79,13 @@ fn port_held_on_ipv4_wildcard_is_not_bindable() {
 /// wildcard side.
 #[test]
 fn port_held_on_ipv4_loopback_is_not_bindable() {
-    let port = free_tcp_port();
-    let held = TcpListener::bind(("127.0.0.1", port)).expect("bind loopback port");
+    let held = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback port");
+    let port = held.local_addr().expect("local_addr").port();
 
     assert!(
         !bindable(port),
         "port {port} is held on 127.0.0.1 and must not be reported bindable"
     );
-
-    drop(held);
-    assert!(bindable(port), "port {port} should free up again");
 }
 
 /// A UDP socket on the same port is a known, documented gap (see the doc
@@ -78,20 +95,19 @@ fn port_held_on_ipv4_loopback_is_not_bindable() {
 /// oversight a future change might "fix" without noticing the tradeoff.
 #[test]
 fn udp_only_conflict_is_not_detected_by_design() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-
-    let held = match UdpSocket::bind(("127.0.0.1", port)) {
-        Ok(socket) => socket,
-        // Another process grabbed the TCP port's number for UDP in the tiny
-        // gap between freeing and rebinding; nothing to assert here.
-        Err(_) => return,
-    };
-
+    // Each UDP socket is held from the moment the OS picks it. The TCP side
+    // of its port is free unless something else took it, so a few are held
+    // and one must be reported bindable: the probe does not see UDP.
+    let held: Vec<(UdpSocket, u16)> = (0..5)
+        .map(|_| {
+            let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("bind UDP port");
+            let port = socket.local_addr().expect("local_addr").port();
+            (socket, port)
+        })
+        .collect();
     assert!(
-        bindable(port),
-        "TCP probe is not expected to see a UDP-only listener on port {port}"
+        held.iter().any(|(_, port)| bindable(*port)),
+        "TCP probe is not expected to see a UDP-only listener, on any of {:?}",
+        held.iter().map(|(_, port)| *port).collect::<Vec<_>>()
     );
-    drop(held);
 }

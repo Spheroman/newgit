@@ -13,14 +13,15 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::App;
-use crate::db::{self, List};
+use crate::db::{self, DbGuard, List};
 use crate::error::{ApiResult, HttpError, fail};
+use crate::landing::{self, Change, Entry, Landing, Move};
 use crate::names::{
-    self, ProjectId, RepoRef, fork_namespace, namespace_prefix, parse_project_key, parse_repo_name,
-    part_problem, repo_from_url_or_name,
+    ProjectId, RepoRef, fork_namespace, parse_project_key, parse_repo_name, part_problem,
+    repo_from_url_or_name, user_namespace,
 };
 use crate::policy::{self, Context, Facts, Requester};
-use crate::repos;
+use crate::repos::{self, Repo, Store};
 use crate::tokens::{self, AGENT_TTL_MAX_SECONDS, AGENT_TTL_SECONDS, LOGIN_TTL_SECONDS, NewToken};
 
 /// How long a credential is handed out for. The password is the caller's own
@@ -33,9 +34,18 @@ pub struct ApiRequest {
     pub query: BTreeMap<String, String>,
     pub bearer: Option<String>,
     pub dev_login: Option<String>,
+    /// The few other headers a route reads (GitHub's webhook headers), by
+    /// lowercase name.
+    pub headers: BTreeMap<String, String>,
     /// `scheme://host`, for the URLs answers name.
     pub origin: String,
     pub body: Vec<u8>,
+}
+
+impl ApiRequest {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).map(String::as_str)
+    }
 }
 
 pub struct ApiResponse {
@@ -132,7 +142,7 @@ fn is_commit_id(value: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn decode(segment: &str) -> String {
+pub fn decode(segment: &str) -> String {
     let bytes = segment.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -234,6 +244,7 @@ pub fn handle(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
         ("POST", "/v1/login/device") => return device_start(app),
         ("POST", "/v1/login/poll") => return device_poll(app, request),
         ("POST", "/v1/dev/login") => return dev_login(app, request),
+        ("POST", "/v1/webhooks/github") => return crate::mirror::webhook::receive(app, request),
         _ => {}
     }
 
@@ -260,7 +271,8 @@ pub fn handle(app: &App, request: &ApiRequest) -> ApiResult<ApiResponse> {
         }
         ("POST", "/v1/tokens") => return create_agent_token(app, &db, &caller, request),
         ("POST", "/v1/tokens/renew") => return renew_token(app, &db, &caller),
-        ("POST", "/v1/projects") => return create_project(app, &db, &caller, request),
+        ("POST", "/v1/projects") => return create_project(app, db, &caller, request),
+        ("GET", "/v1/serve/status") => return crate::status::status(app, db, &caller),
         _ => {}
     }
 
@@ -495,17 +507,27 @@ fn credential_json(origin: &str, caller: &Caller, repo: &str, scope: &str) -> Va
     })
 }
 
-/// Make the repo of a tracker in Git and let the caller seed it, once, briefly.
+/// Make the repo of a tracker in Git, if it is not made, and let the caller
+/// seed it, once, briefly. A repo made here is said in `made`, for the
+/// caller to land once it lets go of the db lock.
 fn seed(
-    app: &App,
+    project: &ProjectContext<'_>,
     db: &Connection,
     origin: &str,
     caller: &Caller,
-    project: &ProjectId,
     tracker: &str,
+    made: &mut Change,
 ) -> ApiResult<Value> {
-    let repo = RepoRef::tracker(project, tracker).name();
-    repos::create(&names::tracker_dir(&app.config.data, project, tracker))?;
+    let repo = RepoRef::tracker(&project.id, tracker).name();
+    // A seed is alone in a store of its own until its tracker joins a branch:
+    // whoever seeds it may not read every audience, and a push can name any
+    // object in the store it lands in.
+    if !project.own(tracker).exists() {
+        made.stores.insert(
+            tracker.to_owned(),
+            project.make(tracker, Store::Tracker(tracker.to_owned()))?,
+        );
+    }
     db::grant(
         db,
         &repo,
@@ -518,9 +540,36 @@ fn seed(
     Ok(answer)
 }
 
-fn create_project(
-    app: &App,
-    db: &Connection,
+/// Land the repos `made` made in `key`, by `by`, with the db lock let go of:
+/// `db` is taken, and handed back once it has landed.
+fn land_made<'a>(
+    app: &'a App,
+    db: DbGuard<'a>,
+    key: &str,
+    by: &str,
+    made: Change,
+) -> ApiResult<DbGuard<'a>> {
+    if made.stores.is_empty() {
+        return Ok(db);
+    }
+    drop(db);
+    app.log.land(
+        app,
+        Landing {
+            entry: Entry {
+                by: by.to_owned(),
+                homes: [(key.to_owned(), made)].into(),
+                ..Entry::default()
+            },
+            ..Landing::default()
+        },
+    )?;
+    Ok(app.db.lock())
+}
+
+fn create_project<'a>(
+    app: &'a App,
+    db: DbGuard<'a>,
     caller: &Caller,
     request: &ApiRequest,
 ) -> ApiResult<ApiResponse> {
@@ -552,7 +601,7 @@ fn create_project(
     let key = id.key();
     let cap = app.config.projects_per_login;
     if !tokens::listed(&app.config.admin_logins, &caller.login)
-        && db::owned_count(db, &caller.login)? >= cap
+        && db::owned_count(&db, &caller.login)? >= cap
     {
         return fail(
             403,
@@ -562,16 +611,53 @@ fn create_project(
             ),
         );
     }
-    if !db::create_project(db, &key, &id.owner, &name)? {
+    if db::project(&db, &key)?.is_some() {
         return fail(409, format!("project `{key}` already exists"));
     }
-    // A deleted project's name is free again: start from nothing on disk too.
-    let _ = repos::delete(&id.dir(&app.config.data));
-    app.trackers_moved();
+    // Made by a landing, as a new incarnation: a landing written for a
+    // project deleted under this name never acts on this one.
+    let incarnation = tokens::random_hex(16);
+    drop(db);
+    app.log.land(
+        app,
+        Landing {
+            entry: Entry {
+                by: caller.login.clone(),
+                homes: [(
+                    key.clone(),
+                    Change {
+                        incarnation: incarnation.clone(),
+                        made: Some(landing::Made {
+                            owner: id.owner.clone(),
+                            name: name.clone(),
+                        }),
+                        ..Change::default()
+                    },
+                )]
+                .into(),
+                ..Entry::default()
+            },
+            ..Landing::default()
+        },
+    )?;
+    let db = app.db.lock();
+    let project = ProjectContext::open(app, &db, &id)?;
     let mut seeds = Vec::new();
+    let mut made = Change {
+        incarnation: project.info.incarnation.clone(),
+        ..Change::default()
+    };
     for tracker in &spec.trackers {
-        seeds.push(seed(app, db, &request.origin, caller, &id, tracker)?);
+        seeds.push(seed(
+            &project,
+            &db,
+            &request.origin,
+            caller,
+            tracker,
+            &mut made,
+        )?);
     }
+    drop(land_made(app, db, &key, &caller.login, made)?);
     created(json!({
         "owner": id.owner, "name": name, "key": key,
         "endpoint": endpoint_url(&request.origin, &id), "seeds": seeds,
@@ -588,6 +674,10 @@ pub struct ProjectContext<'a> {
     pub info: db::ProjectInfo,
     pub member: bool,
     pub links: BTreeMap<String, (String, String)>,
+    /// The store each of this project's own trackers is in, as its rows say.
+    stores: std::cell::RefCell<BTreeMap<String, Store>>,
+    /// The store each linked tracker is in, at its home.
+    linked_stores: BTreeMap<String, Store>,
 }
 
 impl ProjectContext<'_> {
@@ -609,16 +699,43 @@ impl ProjectContext<'_> {
                 ),
             );
         }
+        let mut project = Self::open(app, db, id)?;
+        project.member = db::is_member(db, &key, &caller.login)?;
+        Ok(project)
+    }
+
+    /// A project as the server itself reads it, as nobody's member.
+    pub fn open<'a>(
+        app: &'a App,
+        db: &Connection,
+        id: &ProjectId,
+    ) -> ApiResult<ProjectContext<'a>> {
+        let key = id.key();
         let Some(info) = db::project(db, &key)? else {
             return fail(404, format!("no project `{key}`"));
         };
+        let stores = db::tracker_stores(db, &key)?
+            .into_iter()
+            .filter_map(|(tracker, name)| Some((tracker, Store::parse(&name)?)))
+            .collect();
+        let links = db::links(db, &key)?;
+        let mut linked_stores = BTreeMap::new();
+        for (tracker, (home, there)) in &links {
+            if let Some(store) =
+                db::tracker_store(db, home, there)?.and_then(|name| Store::parse(&name))
+            {
+                linked_stores.insert(tracker.clone(), store);
+            }
+        }
         Ok(ProjectContext {
             app,
-            member: db::is_member(db, &key, &caller.login)?,
-            links: db::links(db, &key)?,
+            member: false,
+            links,
             id: id.clone(),
             key,
             info,
+            stores: std::cell::RefCell::new(stores),
+            linked_stores,
         })
     }
 
@@ -639,13 +756,212 @@ impl ProjectContext<'_> {
         }
     }
 
-    pub fn tracker_dir(&self, tracker: &str) -> camino::Utf8PathBuf {
+    /// The repo a tracker named here is: its own, or for a link its home's.
+    pub fn tracker(&self, tracker: &str) -> Repo {
         match self.repo_of(tracker) {
             RepoRef::Tracker {
-                project, tracker, ..
-            } => names::tracker_dir(&self.app.config.data, &project, &tracker),
-            RepoRef::Fork { .. } => unreachable!(),
+                project: home,
+                tracker: there,
+                ..
+            } if home != self.id => Repo::tracker(
+                &home.dir(&self.app.config.data),
+                self.linked_stores.get(tracker).cloned(),
+                &there,
+            ),
+            _ => self.own(tracker),
         }
+    }
+
+    /// This project's own tracker `tracker`, links aside: in the store its row
+    /// names, or alone in a store of its own when it has none yet.
+    pub fn own(&self, tracker: &str) -> Repo {
+        Repo::tracker(
+            &self.home(),
+            self.stores.borrow().get(tracker).cloned(),
+            tracker,
+        )
+    }
+
+    pub fn home(&self) -> camino::Utf8PathBuf {
+        self.id.dir(&self.app.config.data)
+    }
+
+    /// Where `repo`, one of this project's, is. `private` says whether a
+    /// fork's instance is private: its forks are in its own store.
+    pub fn locate(&self, repo: &RepoRef, private: bool) -> Repo {
+        match repo {
+            RepoRef::Tracker {
+                tracker,
+                login: None,
+                ..
+            } => self.own(tracker),
+            RepoRef::Tracker {
+                tracker,
+                login: Some(login),
+                ..
+            } => Repo::new(
+                &self.home(),
+                Store::User(login.clone()),
+                user_namespace(tracker),
+            ),
+            RepoRef::Fork {
+                instance, tracker, ..
+            } if private => Repo::new(
+                &self.home(),
+                Store::Instance(instance.clone()),
+                fork_namespace(tracker, instance),
+            ),
+            RepoRef::Fork {
+                instance, tracker, ..
+            } => Repo {
+                namespace: fork_namespace(tracker, instance),
+                ..self.own(tracker)
+            },
+        }
+    }
+
+    /// Make tracker `tracker`'s repo in `store`: the store move that says so,
+    /// for the caller to land (its row is the landing's to write).
+    pub fn make(&self, tracker: &str, store: Store) -> ApiResult<Move> {
+        let repo = Repo::tracker(&self.home(), Some(store), tracker);
+        repo.create()?;
+        Ok(Move {
+            from: None,
+            to: repo.store.name(),
+        })
+    }
+
+    /// This project's own trackers that have a store row.
+    pub fn placed(&self) -> Vec<String> {
+        self.stores.borrow().keys().cloned().collect()
+    }
+
+    /// Where each of this project's trackers belongs once a landing leaves
+    /// its definitions as `after` and the trackers on its branches as
+    /// `listed`, where that is not the store it is in: the moves the landing
+    /// makes, put in place after it is written down. A tracker belongs in its
+    /// audience's store once its audience is decided (it is on a branch, or
+    /// it is not in Git); a seed not on a branch stays alone, and so does a
+    /// tracker not made. Every store moved to is checked to be made for its
+    /// own audience first, so one in the way refuses the landing whole.
+    pub fn moves(
+        &self,
+        after: &BTreeMap<String, Facts>,
+        listed: &BTreeSet<String>,
+    ) -> ApiResult<BTreeMap<String, Move>> {
+        let mut moves = BTreeMap::new();
+        for (tracker, store) in self.stores.borrow().iter() {
+            if self.links.contains_key(tracker) {
+                continue;
+            }
+            let facts = after.get(tracker);
+            let decided = match facts {
+                None => false,
+                Some(facts) if !facts.git => true,
+                Some(_) => listed.contains(tracker),
+            };
+            if !decided {
+                continue;
+            }
+            let to = Store::for_tracker(facts, tracker);
+            if to == *store {
+                continue;
+            }
+            let there = Repo::tracker(&self.home(), Some(to.clone()), tracker);
+            if !self.own(tracker).exists() && !there.exists() {
+                continue;
+            }
+            repos::check_store(&to.dir(&self.home()), &to)?;
+            moves.insert(
+                tracker.clone(),
+                Move {
+                    from: Some(store.name()),
+                    to: to.name(),
+                },
+            );
+        }
+        Ok(moves)
+    }
+
+    /// Whether `tracker`'s audience is decided, so it belongs in its
+    /// audience's store: one on a branch, or one outside Git. A seed not on a
+    /// branch yet stays alone.
+    fn decided(&self, db: &Connection, tracker: &str, facts: Option<&Facts>) -> ApiResult<bool> {
+        Ok(match facts {
+            None => false,
+            Some(facts) if !facts.git => true,
+            Some(_) => db::listed_trackers(db, &self.key)?
+                .iter()
+                .any(|listed| listed == tracker),
+        })
+    }
+
+    /// Where `repo` is served from, once it is in exactly the store its
+    /// tracker's current facts call for: its audience's, its user's, or for a
+    /// private instance's fork the instance's. Where it is is its row, which
+    /// only a landing changes; nothing here moves storage. Anything else is
+    /// refused, never served from a store whose readers are another
+    /// audience. Every repo [`authorize`] hands out, and every merge's
+    /// objects, are found here.
+    pub fn served(
+        &self,
+        db: &Connection,
+        repo: &RepoRef,
+        facts: Option<&Facts>,
+        private: bool,
+    ) -> ApiResult<Repo> {
+        let tracker = repo.tracker_name();
+        let decided = self.decided(db, tracker, facts)?;
+        let (location, expected) = self.placed_for(repo, facts, private, decided);
+        let made = match repo {
+            RepoRef::Tracker { login: None, .. } => location.exists(),
+            _ => repos::store_exists(&location.dir()),
+        };
+        served_from(repo, location, &expected, made)
+    }
+
+    /// [`Self::served`]'s half that reads only rows: where `repo` is, and the
+    /// store its tracker's facts call for, given whether its audience is
+    /// `decided`. What is read under the db lock; [`served_from`] is the
+    /// rest, which runs Git, and may run after it is let go of.
+    pub fn placed_for(
+        &self,
+        repo: &RepoRef,
+        facts: Option<&Facts>,
+        private: bool,
+        decided: bool,
+    ) -> (Repo, Store) {
+        let tracker = repo.tracker_name();
+        let location = self.locate(repo, private);
+        let expected = match repo {
+            RepoRef::Tracker {
+                login: Some(login), ..
+            } => Store::User(login.clone()),
+            RepoRef::Fork { instance, .. } if private => Store::Instance(instance.clone()),
+            _ if decided && !self.links.contains_key(tracker) => Store::for_tracker(facts, tracker),
+            // Undecided: where its row says, alone.
+            _ => self.own(tracker).store,
+        };
+        (location, expected)
+    }
+
+    /// [`Self::served`] for tracker `tracker` named here: its own, or for a
+    /// link its home's, as its home's facts place it.
+    pub fn served_tracker(&self, db: &Connection, tracker: &str) -> ApiResult<Repo> {
+        if let Some((home, there)) = self.links.get(tracker) {
+            let Some(id) = parse_project_key(home) else {
+                return fail(404, format!("`{tracker}` links to `{home}`, not a project"));
+            };
+            let home = ProjectContext::open(self.app, db, &id)?;
+            return home.served_tracker(db, there);
+        }
+        let facts = self.facts(db, tracker)?;
+        self.served(
+            db,
+            &RepoRef::tracker(&self.id, tracker),
+            facts.as_ref(),
+            false,
+        )
     }
 
     pub fn definitions<'n>(
@@ -656,7 +972,7 @@ impl ProjectContext<'_> {
         let listed = db::listed_trackers(db, &self.key)?;
         let mut all: Vec<String> = names.into_iter().map(str::to_owned).collect();
         all.extend(listed);
-        Ok(self.app.definitions(&self.id, all))
+        Ok(self.app.definitions(db, &self.id, all))
     }
 
     pub fn facts(&self, db: &Connection, tracker: &str) -> ApiResult<Option<Facts>> {
@@ -684,6 +1000,34 @@ impl ProjectContext<'_> {
     }
 }
 
+/// [`ProjectContext::served`]'s half that runs Git: `location` (`made`, or
+/// not yet), refused unless it is in exactly the store `expected` and that
+/// store was made for that audience.
+pub fn served_from(
+    repo: &RepoRef,
+    location: Repo,
+    expected: &Store,
+    made: bool,
+) -> ApiResult<Repo> {
+    // Not made yet: made where it belongs, on its first write.
+    if !made {
+        return Ok(location);
+    }
+    let made_for = repos::audience_of(&location.dir());
+    if location.store != *expected || made_for.as_deref() != Some(expected.name().as_str()) {
+        return fail(
+            500,
+            format!(
+                "{} is not in the store its audience calls for ({}, not {}): refused until a landing puts it there",
+                repo.name(),
+                expected.name(),
+                made_for.unwrap_or_else(|| location.store.name()),
+            ),
+        );
+    }
+    Ok(location)
+}
+
 fn project_route(
     app: &App,
     request: &ApiRequest,
@@ -691,7 +1035,7 @@ fn project_route(
     id: &ProjectId,
     rest: &str,
 ) -> ApiResult<ApiResponse> {
-    let mut db = app.db.lock();
+    let db = app.db.lock();
     let project = ProjectContext::load(app, &db, caller, id)?;
     let method = request.method.as_str();
     let key = project.key.clone();
@@ -705,7 +1049,7 @@ fn project_route(
         return credentials(&project, &db, caller, request);
     }
     if method == "DELETE" && rest.is_empty() {
-        return delete_project(&project, &db, caller);
+        return delete_project(&project, db, caller);
     }
     if let ("POST", ["objects", tracker, commit]) = (method, segments.as_slice()) {
         return crate::merge::receive_objects(
@@ -729,6 +1073,7 @@ fn project_route(
                 "createdAt": project.info.created_at, "defaultBranch": project.info.default_branch,
                 "key": key, "endpoint": endpoint_url(&request.origin, &project.id),
                 "members": db::members(&db, &key)?, "branches": db::branches(&db, &key)?,
+                "epoch": db::epoch(&db, &key)?,
             });
             answer["name"] = json!(project.info.name);
             ok(answer)
@@ -756,7 +1101,7 @@ fn project_route(
             }
             ok(json!({ "login": removed, "removed": db::remove_member(&db, &key, &removed)? }))
         }
-        ("POST", ["trackers"]) => create_tracker(&project, &db, caller, request),
+        ("POST", ["trackers"]) => create_tracker(&project, db, caller, request),
         ("GET", ["state"]) => state(&project, &db),
         ("GET", ["branches"]) => ok(json!({
             "default": project.info.default_branch, "branches": db::branches(&db, &key)?,
@@ -785,6 +1130,27 @@ fn project_route(
             &request.origin,
         ),
         ("GET", ["branches", branch]) => {
+            if let Some(at) = request.query.get("at") {
+                // State at a landing: its stamp, never a date.
+                let Ok(stamp) = at.parse::<landing::Stamp>() else {
+                    return fail(400, "at is a landing's stamp: a whole number");
+                };
+                let voided = db::voided_at(&db, &key, stamp)?;
+                drop(db);
+                return match app.log.list_at(
+                    &key,
+                    &project.info.incarnation,
+                    branch,
+                    stamp,
+                    voided,
+                )? {
+                    Some(list) => ok(json!({ "name": branch, "list": list, "stamp": stamp })),
+                    None => fail(
+                        404,
+                        format!("no branch `{branch}` in {key} at landing {stamp}"),
+                    ),
+                };
+            }
             let Some(list) = db::list_of(&db, &key, branch)? else {
                 return fail(404, format!("no branch `{branch}` in {key}"));
             };
@@ -794,7 +1160,7 @@ fn project_route(
                 .unwrap_or_else(|| json!({ "name": branch, "list": list }));
             ok(found)
         }
-        ("PUT", ["branches", branch]) => create_branch(&project, &mut db, caller, request, branch),
+        ("PUT", ["branches", branch]) => create_branch(&project, db, caller, request, branch),
         ("POST", ["instances"]) => create_instance(&project, &db, caller, request),
         ("GET", ["instances"]) => {
             let visible: Vec<Value> = db::instances(&db, &key)?
@@ -1138,7 +1504,7 @@ fn visible_instance(
 
 fn delete_project(
     project: &ProjectContext<'_>,
-    db: &Connection,
+    db: DbGuard<'_>,
     caller: &Caller,
 ) -> ApiResult<ApiResponse> {
     caller.require_human("delete projects")?;
@@ -1149,32 +1515,31 @@ fn delete_project(
             &format!("delete {}", project.key),
         )?;
     }
-    let dir = project.id.dir(&project.app.config.data);
-    let repos_deleted = count_repos(&dir);
-    db::delete_project(db, &project.key)?;
-    db::revoke_pinned(db, &project.key, None)?;
-    repos::delete(&dir)?;
-    project.app.trackers_moved();
+    let repos_deleted = repos::count_repos(&project.home());
+    drop(db);
+    // Its branches and stores leave the log's state with it.
+    project.app.log.land(
+        project.app,
+        Landing {
+            entry: Entry {
+                by: caller.login.clone(),
+                homes: [(
+                    project.key.clone(),
+                    Change {
+                        incarnation: project.info.incarnation.clone(),
+                        removed: true,
+                        ..Change::default()
+                    },
+                )]
+                .into(),
+                ..Entry::default()
+            },
+            ..Landing::default()
+        },
+    )?;
+    let db = project.app.db.lock();
+    db::revoke_pinned(&db, &project.key, None)?;
     ok(json!({ "key": project.key, "deleted": true, "repos_deleted": repos_deleted }))
-}
-
-fn count_repos(dir: &camino::Utf8Path) -> usize {
-    let mut count = 0;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(at) = stack.pop() {
-        let Ok(entries) = at.read_dir_utf8() else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path().to_path_buf();
-            if path.extension() == Some("git") {
-                count += 1;
-            } else if path.is_dir() {
-                stack.push(path);
-            }
-        }
-    }
-    count
 }
 
 fn credentials(
@@ -1257,6 +1622,71 @@ fn credentials(
     ok(one(&repo)?)
 }
 
+/// Where a repo authorized is: there, or to be made there by its first
+/// write once the db lock is let go of.
+pub enum Authorized {
+    Here(Repo),
+    /// Made by its first write: by its landing (a tracker's repo, whose row
+    /// is the log's), or with none for one user's own repo; and a fork
+    /// started at its upstream's as it is made ([`ForkStart`]).
+    Make {
+        repo: Repo,
+        landing: Option<Landing>,
+        fork: Option<Box<ForkStart>>,
+    },
+}
+
+impl Authorized {
+    /// Where it is, made if it is to be, with the db lock let go of (`db`
+    /// is taken, and handed back): a fork's commits copied into a narrower
+    /// store first, then its starting refs and its record moved by the
+    /// landing that makes it, so it exists whole or not at all.
+    pub fn made<'a>(self, app: &'a App, db: DbGuard<'a>) -> ApiResult<(Repo, DbGuard<'a>)> {
+        match self {
+            Self::Here(repo) => Ok((repo, db)),
+            Self::Make {
+                repo,
+                landing,
+                fork,
+            } => {
+                drop(db);
+                repo.create()?;
+                let starts = match &fork {
+                    Some(fork) => fork.place(&repo)?,
+                    None => Vec::new(),
+                };
+                match (landing, &fork) {
+                    (Some(mut landing), fork) => {
+                        if fork.is_some() {
+                            app.log.wait_while("hold-fork-start");
+                        }
+                        if let Some(fork) = fork {
+                            landing
+                                .asked
+                                .extend(starts.into_iter().map(|(reference, commit)| {
+                                    landing::Asked {
+                                        home: fork.home.clone(),
+                                        tracker: fork.tracker.clone(),
+                                        reference,
+                                        old: None,
+                                        new: commit,
+                                    }
+                                }));
+                        }
+                        app.log.land(app, landing)?;
+                    }
+                    (None, Some(_)) => {
+                        repo.start_refs(&starts)?;
+                        app.trackers_moved();
+                    }
+                    (None, None) => {}
+                }
+                Ok((repo, app.db.lock()))
+            }
+        }
+    }
+}
+
 /// What the rules say about `caller` and `repo`, and where it is. Shared by
 /// the credentials route and every Git request.
 pub fn authorize(
@@ -1265,7 +1695,7 @@ pub fn authorize(
     caller: &Caller,
     repo: &RepoRef,
     write: bool,
-) -> ApiResult<names::Location> {
+) -> ApiResult<Authorized> {
     let who = project.who(caller);
     let mut context = Context::default();
     let mut private = false;
@@ -1286,35 +1716,210 @@ pub fn authorize(
             ),
         );
     };
-    policy::decide(repo, write, &who, Some(&facts), &context)
-        .map_err(|why| HttpError::new(403, why))?;
-    let location = names::locate(&project.app.config.data, repo, private);
+    policy::decide(repo, write, &who, Some(&facts), &context).map_err(|why| {
+        HttpError::new(
+            403,
+            match &facts.capped {
+                Some(capped) => format!("{why} ({capped})"),
+                None => why,
+            },
+        )
+    })?;
     let name = repo.name();
-    match repo {
-        RepoRef::Fork {
-            instance, tracker, ..
-        } => {
-            if !db::has_fork(db, &project.key, instance, tracker)? {
-                return fail(404, format!("{name} does not exist yet"));
-            }
-        }
-        RepoRef::Tracker { .. } if !facts.git => {
-            // A tracker outside Git gets its repo on its first write.
-            if !repos::exists(&location.git_dir) {
-                if write {
-                    repos::create(&location.git_dir)?;
-                } else {
-                    return fail(404, format!("{name} does not exist yet"));
-                }
-            }
-        }
-        RepoRef::Tracker { .. } => {
-            if !repos::exists(&location.git_dir) {
-                return fail(404, format!("{name} does not exist yet"));
-            }
-        }
+    if let RepoRef::Fork {
+        instance, tracker, ..
+    } = repo
+        && !db::has_fork(db, &project.key, instance, tracker)?
+    {
+        return fail(404, format!("{name} does not exist yet"));
     }
-    Ok(location)
+    // Never served from a store its readers are not exactly the audience of.
+    let location = project.served(db, repo, Some(&facts), private)?;
+    let RepoRef::Tracker { tracker, login, .. } = repo else {
+        return Ok(Authorized::Here(location));
+    };
+    let fork = !facts.git && write && facts.from.is_some();
+    if location.exists() {
+        // One user's own fork, made and never started (stopped before its
+        // refs moved): started now. A tracker's is made by its landing, refs
+        // and record with it, so it never is.
+        if fork
+            && login.is_some()
+            && location.recorded_from().is_none()
+            && location.list_refs("refs/heads/")?.is_empty()
+        {
+            return Ok(Authorized::Make {
+                fork: fork_start(project, db, &who, &facts, tracker, login.as_deref())?
+                    .map(Box::new),
+                repo: location,
+                landing: None,
+            });
+        }
+        return Ok(Authorized::Here(location));
+    }
+    if facts.git || !write {
+        return fail(404, format!("{name} does not exist yet"));
+    }
+    // A tracker outside Git gets its repo on its first write. A fork's is
+    // checked before anything is made or copied, and starts at its
+    // upstream's before anyone may push to it.
+    let fork = if fork {
+        fork_start(project, db, &who, &facts, tracker, login.as_deref())?.map(Box::new)
+    } else {
+        None
+    };
+    if login.is_some() {
+        if fork.is_none() {
+            location.create()?;
+            return Ok(Authorized::Here(location));
+        }
+        return Ok(Authorized::Make {
+            repo: location,
+            landing: None,
+            fork,
+        });
+    }
+    let made = Repo::tracker(
+        &project.home(),
+        Some(Store::for_tracker(Some(&facts), tracker)),
+        tracker,
+    );
+    let step = Move {
+        from: None,
+        to: made.store.name(),
+    };
+    let landing = Landing {
+        entry: Entry {
+            by: caller.login.clone(),
+            homes: [(
+                project.key.clone(),
+                Change {
+                    incarnation: project.info.incarnation.clone(),
+                    stores: [(tracker.clone(), step)].into(),
+                    ..Change::default()
+                },
+            )]
+            .into(),
+            ..Entry::default()
+        },
+        // A fork's start was checked against the definitions as they are
+        // now, and its commits are copied once the lock is let go of: the
+        // landing that makes it stands only if they have not changed since.
+        epochs: match &fork {
+            Some(_) => vec![(project.key.clone(), db::epoch(db, &project.key)?)],
+            None => Vec::new(),
+        },
+        ..Landing::default()
+    };
+    Ok(Authorized::Make {
+        repo: made,
+        landing: Some(landing),
+        fork,
+    })
+}
+
+/// What a fork's repo starts with, read under the db lock and put in place
+/// once it is let go of ([`Authorized::made`]).
+pub struct ForkStart {
+    home: String,
+    tracker: String,
+    upstream: String,
+    /// The upstream's repo, when there is anything to start from.
+    source: Option<Repo>,
+    /// Each ref it starts with, as its readers name it, at its upstream's
+    /// commit: the upstream's branches, and its pin as the fork's.
+    refs: Vec<(String, String)>,
+}
+
+impl ForkStart {
+    /// Put what the fork starts with into `fork`'s store, before anything
+    /// says it is there: the upstream's commits (in its own store already
+    /// when the two are one: same audience, refs alone, nothing copied; or
+    /// else fetched into the narrower one, which takes only what those refs
+    /// reach, all of it readable there already), and the record of what it
+    /// was made from ([`repos::FORK_RECORD`]). Returns every ref to move.
+    fn place(&self, fork: &Repo) -> ApiResult<Vec<(String, String)>> {
+        if let Some(source) = &self.source
+            && source.dir() != fork.dir()
+        {
+            let commits: Vec<String> = self.refs.iter().map(|(_, commit)| commit.clone()).collect();
+            fork.fetch_commits(&source.dir(), &commits)?;
+        }
+        let mut refs = self.refs.clone();
+        refs.push((
+            format!("{}{}", repos::FORK_RECORD, self.upstream),
+            fork.record_commit(&self.upstream)?,
+        ));
+        Ok(refs)
+    }
+}
+
+/// What fork `tracker` (its definition's `facts`) starts with: its
+/// upstream's (`from`) branches, for a per-user upstream the caller's own,
+/// or nothing to start from (an upstream in Git, linked, or not made yet)
+/// but its record. Its definition was held to its upstream's audience when
+/// it was read ([`policy`]'s `cap_forks`), so it is made in the upstream's
+/// store or a narrower one. Refused before anything is made or copied when
+/// the fork's audience isn't within its upstream's, or when the caller may
+/// not read the upstream: starting the fork would hand them what they can't
+/// read. `None` for a tracker that is not a fork.
+fn fork_start(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    who: &policy::Requester,
+    facts: &Facts,
+    tracker: &str,
+    login: Option<&str>,
+) -> ApiResult<Option<ForkStart>> {
+    let Some(upstream) = &facts.from else {
+        return Ok(None);
+    };
+    let Some(upstream_facts) = project.facts(db, upstream)? else {
+        return fail(
+            404,
+            format!("`{upstream}`, which this tracker is a fork of (`from`), is not defined"),
+        );
+    };
+    policy::may_start_fork(&project.id, upstream, facts, &upstream_facts, who)
+        .map_err(|why| HttpError::new(403, why))?;
+    let mut start = ForkStart {
+        home: project.key.clone(),
+        tracker: tracker.to_owned(),
+        upstream: upstream.clone(),
+        source: None,
+        refs: Vec::new(),
+    };
+    if upstream_facts.git || project.links.contains_key(upstream) {
+        return Ok(Some(start));
+    }
+    // A per-user upstream is each user's own: the caller's starts their fork.
+    let source_login = match (&upstream_facts.audience, login) {
+        (policy::Audience::User, Some(login)) => Some(login.to_owned()),
+        (policy::Audience::User, None) => return Ok(Some(start)),
+        _ => None,
+    };
+    let source = RepoRef::Tracker {
+        project: project.id.clone(),
+        tracker: upstream.clone(),
+        login: source_login,
+    };
+    let source = project.served(db, &source, Some(&upstream_facts), false)?;
+    if !source.exists() {
+        return Ok(Some(start));
+    }
+    start.refs = source.list_refs("refs/heads/")?;
+    let pin = format!("refs/trackers/{upstream}/main");
+    if let Some((_, commit)) = source
+        .list_refs(&pin)?
+        .into_iter()
+        .find(|(reference, _)| *reference == pin)
+    {
+        start
+            .refs
+            .push((format!("refs/trackers/{tracker}/main"), commit));
+    }
+    start.source = Some(source);
+    Ok(Some(start))
 }
 
 fn credential(
@@ -1325,18 +1930,30 @@ fn credential(
     write: bool,
     origin: &str,
 ) -> ApiResult<Value> {
+    // A repo its first write makes is made by that write, not by asking.
     authorize(project, db, caller, repo, write)?;
-    Ok(credential_json(
+    let mut answer = credential_json(
         origin,
         caller,
         &repo.name(),
         if write { "write" } else { "read" },
-    ))
+    );
+    // A writer is told when what it writes is served narrower than the
+    // definition it believes (a fork re-added under its old name is still
+    // held to the upstream its repo was made from, #437).
+    if write
+        && let Some(capped) = project
+            .facts(db, repo.tracker_name())?
+            .and_then(|facts| facts.capped)
+    {
+        answer["capped"] = Value::String(capped);
+    }
+    Ok(answer)
 }
 
 fn create_tracker(
     project: &ProjectContext<'_>,
-    db: &Connection,
+    db: DbGuard<'_>,
     caller: &Caller,
     request: &ApiRequest,
 ) -> ApiResult<ApiResponse> {
@@ -1351,14 +1968,14 @@ fn create_tracker(
         return fail(400, "name is required");
     };
     require_part("tracker name", &tracker)?;
-    require_governor(project, db, caller, &tracker)?;
+    require_governor(project, &db, caller, &tracker)?;
     if let Some(link) = spec.link {
         let Some(link) = link.as_str() else {
             return fail(400, "link names a tracker: `<owner>/<project>[/<path>]`");
         };
-        return link_tracker(project, db, caller, &tracker, link);
+        return link_tracker(project, &db, caller, &tracker, link);
     }
-    let defined = project.facts(db, &tracker)?;
+    let defined = project.facts(&db, &tracker)?;
     if defined.as_ref().is_some_and(|facts| !facts.git) {
         return fail(
             400,
@@ -1366,36 +1983,28 @@ fn create_tracker(
         );
     }
     let repo = RepoRef::tracker(&project.id, &tracker).name();
-    if repos::exists(&names::tracker_dir(
-        &project.app.config.data,
-        &project.id,
-        &tracker,
-    )) {
-        // Made before by a first publication that did not finish: until it is
-        // on a branch, its owner may seed it again.
-        if db::listed_trackers(db, &project.key)?.contains(&tracker) {
-            return fail(
-                409,
-                format!("{repo} exists already; its history moves only through `newgit merge`"),
-            );
-        }
-        return ok(seed(
-            project.app,
-            db,
-            &request.origin,
-            caller,
-            &project.id,
-            &tracker,
-        )?);
+    let again = project.own(&tracker).exists();
+    // Made before by a first publication that did not finish: until it is
+    // on a branch, its owner may seed it again.
+    if again && db::listed_trackers(&db, &project.key)?.contains(&tracker) {
+        return fail(
+            409,
+            format!("{repo} exists already; its history moves only through `newgit merge`"),
+        );
     }
-    created(seed(
+    let mut made = Change {
+        incarnation: project.info.incarnation.clone(),
+        ..Change::default()
+    };
+    let answer = seed(project, &db, &request.origin, caller, &tracker, &mut made)?;
+    drop(land_made(
         project.app,
         db,
-        &request.origin,
-        caller,
-        &project.id,
-        &tracker,
-    )?)
+        &project.key,
+        &caller.login,
+        made,
+    )?);
+    if again { ok(answer) } else { created(answer) }
 }
 
 fn link_tracker(
@@ -1442,7 +2051,7 @@ fn link_tracker(
         &Context::default(),
     )
     .map_err(|why| HttpError::new(403, why))?;
-    if !repos::exists(&names::tracker_dir(&project.app.config.data, &home, &there)) {
+    if !home_project.own(&there).exists() {
         return fail(404, format!("{} does not exist", repo.name()));
     }
     db::add_link(db, &project.key, tracker, &home.key(), &there)?;
@@ -1489,7 +2098,7 @@ fn state(project: &ProjectContext<'_>, db: &Connection) -> ApiResult<ApiResponse
             if !definitions.get(tracker).is_some_and(|facts| facts.pinned) {
                 continue;
             }
-            if let Some(main) = repos::branch_head(&project.tracker_dir(tracker), None, "main")
+            if let Some(main) = project.tracker(tracker).branch_head("main")
                 && main != *pin
             {
                 held.push(json!({ "tracker": tracker, "pin": pin, "main": main }));
@@ -1501,12 +2110,19 @@ fn state(project: &ProjectContext<'_>, db: &Connection) -> ApiResult<ApiResponse
         }
         branches.push(entry);
     }
-    ok(json!({ "branches": branches, "pulls": [], "ended": [] }))
+    let running = app_running(project.app);
+    let mut answer =
+        crate::mirror::store::state(db, &project.key, running, crate::db::now_seconds())?;
+    answer["branches"] = json!(branches);
+    if !running {
+        project.app.mirrors.wake_pulls();
+    }
+    ok(answer)
 }
 
 fn create_branch(
     project: &ProjectContext<'_>,
-    db: &mut Connection,
+    db: DbGuard<'_>,
     caller: &Caller,
     request: &ApiRequest,
     branch: &str,
@@ -1545,32 +2161,75 @@ fn create_branch(
     }
     // Every commit is in its tracker's repo before any list names it.
     for (tracker, commit) in &list {
-        let dir = project.tracker_dir(tracker);
-        if !repos::has_commit(&dir, commit) {
+        if !project.tracker(tracker).has_commit(commit) {
             return fail(
                 400,
                 format!("`{tracker}`'s repo has no commit {commit}: push it first"),
             );
         }
     }
-    if !db::create_branch(db, &project.key, branch, &list, &caller.login)? {
+    if db::list_of(&db, &project.key, branch)?.is_some() {
         return fail(
             409,
             format!("branch `{branch}` exists; a branch moves only through `newgit merge`"),
         );
     }
+    // On a branch, each tracker's audience is decided: a seed joins its
+    // audience's store in the same landing.
+    let mut listed: BTreeSet<String> = db::listed_trackers(&db, &project.key)?
+        .into_iter()
+        .collect();
+    listed.extend(list.keys().cloned());
+    let mut names = project.placed();
+    names.extend(list.keys().cloned());
+    let after = project.definitions(&db, names.iter().map(String::as_str))?;
+    // `main`'s first list: nothing was defined before it.
+    if branch == "main"
+        && let Some(refusal) = policy::mount_refusal(&BTreeMap::new(), &after)
+    {
+        return fail(400, refusal);
+    }
+    let mut change = Change {
+        incarnation: project.info.incarnation.clone(),
+        branches: [(branch.to_owned(), list.clone())].into(),
+        stores: project.moves(&after, &listed)?,
+        ..Change::default()
+    };
+    let mut placed = Vec::new();
     // Each tracker's repo has the branch too, so plain Git reading one sees it.
     for (tracker, commit) in &list {
         if project.links.contains_key(tracker) {
             continue;
         }
-        repos::set_refs(
-            &project.tracker_dir(tracker),
-            &[(format!("refs/heads/{branch}"), commit.clone())],
-        )?;
+        placed.push(landing::Placed {
+            home: project.key.clone(),
+            tracker: tracker.clone(),
+            store: db::tracker_store(&db, &project.key, tracker)?,
+        });
+        change.refs.entry(tracker.clone()).or_default().insert(
+            format!("refs/heads/{branch}"),
+            landing::RefMove::to(Some(commit.clone())),
+        );
     }
-    project.app.trackers_moved();
-    let found = db::branches(db, &project.key)?
+    let landing = Landing {
+        entry: Entry {
+            by: caller.login.clone(),
+            homes: [(project.key.clone(), change)].into(),
+            ..Entry::default()
+        },
+        expect: vec![landing::Expect {
+            home: project.key.clone(),
+            branch: branch.to_owned(),
+            list: None,
+        }],
+        placed,
+        ..Landing::default()
+    };
+    drop(db);
+    project.app.log.land(project.app, landing)?;
+    let db = project.app.db.lock();
+    db::end_seed_grants(&db, &project.key, list.keys())?;
+    let found = db::branches(&db, &project.key)?
         .into_iter()
         .find(|found| found["name"] == branch)
         .unwrap_or(Value::Null);
@@ -1643,8 +2302,9 @@ fn create_instance(
 }
 
 /// Make `instance`'s fork of `tracker`: the tracker's branches, copied as
-/// refs into the instance's namespace in the tracker's own repo; for a
-/// private instance, a repo of its own. Making one that exists is a no-op.
+/// refs into the instance's namespace inside the tracker's own; for a
+/// private instance, fetched into the instance's own store. Making one that
+/// exists is a no-op.
 fn make_fork(
     project: &ProjectContext<'_>,
     db: &Connection,
@@ -1660,65 +2320,42 @@ fn make_fork(
     if db::has_fork(db, &project.key, &instance.name, tracker)? {
         return Ok(name);
     }
-    let source = project.tracker_dir(tracker);
-    if !repos::exists(&source) {
+    let source = project.served_tracker(db, tracker)?;
+    if !source.exists() {
         return fail(
             404,
             format!("{} does not exist", project.repo_of(tracker).name()),
         );
     }
-    let location = names::locate(&project.app.config.data, &repo, instance.private);
-    let branches = repos::list_refs(&source, "refs/heads/")?;
-    match &location.namespace {
-        Some(namespace) => {
-            let prefix = namespace_prefix(namespace);
-            let refs: Vec<(String, String)> = branches
-                .into_iter()
-                .map(|(reference, commit)| (format!("{prefix}{reference}"), commit))
-                .collect();
-            repos::set_refs(&location.git_dir, &refs)?;
-        }
-        None => {
-            repos::create(&location.git_dir)?;
-            let output = std::process::Command::new("git")
-                .arg("--git-dir")
-                .arg(location.git_dir.as_str())
-                .args([
-                    "fetch",
-                    "-q",
-                    "--no-tags",
-                    source.as_str(),
-                    "+refs/heads/*:refs/heads/*",
-                ])
-                .output()?;
-            if !output.status.success() {
-                return Err(HttpError::internal(format!(
-                    "copy {tracker} into {name}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                )));
-            }
-        }
+    let fork = project.locate(&repo, instance.private);
+    if fork.store == source.store && fork.home == source.home {
+        fork.set_refs(&source.list_refs("refs/heads/")?)?;
+    } else {
+        fork.copy_from(&source.dir(), &source.prefix(), "refs/heads/")?;
     }
     db::add_fork(db, &project.key, &instance.name, tracker)?;
     Ok(name)
 }
 
 fn remove_forks(project: &ProjectContext<'_>, instance: &db::Instance) -> ApiResult<()> {
-    let data = &project.app.config.data;
     if instance.private {
-        repos::delete(&project.id.dir(data).join("i").join(&instance.name))?;
+        repos::delete(&Store::Instance(instance.name.clone()).dir(&project.home()))?;
         return Ok(());
     }
-    let prefix = namespace_prefix(&fork_namespace(&instance.name));
     let trackers: BTreeSet<&String> = instance.forks.iter().collect();
     for tracker in trackers {
-        repos::delete_refs_under(&project.tracker_dir(tracker), &prefix)?;
+        let fork = RepoRef::Fork {
+            project: project.id.clone(),
+            instance: instance.name.clone(),
+            tracker: tracker.clone(),
+        };
+        project.locate(&fork, false).delete_refs_under("refs/")?;
     }
     Ok(())
 }
 
 /// Why `name` is not a tag name Git accepts, if it is not.
-fn tag_name_problem(name: &str) -> Option<String> {
+pub(crate) fn tag_name_problem(name: &str) -> Option<String> {
     let bad = name.is_empty()
         || name.len() > 200
         || name.starts_with('-')
@@ -1735,6 +2372,21 @@ fn tag_name_problem(name: &str) -> Option<String> {
             .split('/')
             .any(|part| part.starts_with('.') || part.ends_with(".lock"));
     bad.then(|| format!("`{name}` is not a tag name Git accepts"))
+}
+
+/// A tag made or deleted, naming `list`: the stored rooted histories of the
+/// trackers on it (and those they are mounted within) are extended in the
+/// background. A deleted one touches everything (its list is gone).
+fn tagged(project: &ProjectContext<'_>, list: &db::List) {
+    let touched = if list.is_empty() {
+        crate::rooted::Touched::All
+    } else {
+        crate::rooted::Touched::Some(list.keys().cloned().collect())
+    };
+    project
+        .app
+        .rooted
+        .touched([(project.key.clone(), touched)].into());
 }
 
 /// A tag names one point of root's `main`, frozen with the index its root
@@ -1763,6 +2415,34 @@ fn tag_route(
             None => fail(404, format!("no tag `{name}` in {key}")),
         };
     }
+    may_tag(project, db, caller)?;
+    match request.method.as_str() {
+        "DELETE" => {
+            if !db::delete_tag(db, key, name)? {
+                return fail(404, format!("no tag `{name}` in {key}"));
+            }
+            tagged(project, &BTreeMap::new());
+            ok(json!({ "name": name, "deleted": true }))
+        }
+        "PUT" => {
+            let put: Put = body(request)?;
+            let Some(root) = put.root.filter(|root| is_commit_id(root)) else {
+                return fail(400, "root must name root's commit by its full id");
+            };
+            let (tag, made) = make_tag(project, db, &caller.login, name, &root, &put.annotation)?;
+            if made { created(tag) } else { ok(tag) }
+        }
+        method => fail(404, format!("no route for {method} {}", request.path)),
+    }
+}
+
+/// Whether `caller` may make or delete a tag: a person, from their own
+/// login, who maintains root.
+pub(crate) fn may_tag(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    caller: &Caller,
+) -> ApiResult<()> {
     caller.require_human("tag")?;
     caller.require_not_instance("tag")?;
     let root_facts = project
@@ -1775,69 +2455,68 @@ fn tag_route(
         &project.info.owner,
         "root",
     )
-    .map_err(|why| HttpError::new(403, format!("{why}, so may not tag")))?;
-    match request.method.as_str() {
-        "DELETE" => {
-            if !db::delete_tag(db, key, name)? {
-                return fail(404, format!("no tag `{name}` in {key}"));
-            }
-            ok(json!({ "name": name, "deleted": true }))
+    .map_err(|why| HttpError::new(403, format!("{why}, so may not tag")))
+}
+
+/// Make tag `name` at root commit `root`, by `by`: the one way a tag is
+/// made, whether pushed from a project root or made on a mirror. The tag,
+/// and whether this made it (`false`: it was there, naming that commit with
+/// that annotation). One that exists naming anything else is refused, since
+/// a tag never moves, and so is a commit that is not on root's `main`.
+pub(crate) fn make_tag(
+    project: &ProjectContext<'_>,
+    db: &Connection,
+    by: &str,
+    name: &str,
+    root: &str,
+    annotation: &Value,
+) -> ApiResult<(Value, bool)> {
+    let key = &project.key;
+    if !annotation.is_null() {
+        let tagger = annotation["tagger"].as_str();
+        if tagger.is_none() || !annotation["message"].is_string() {
+            return fail(
+                400,
+                "annotation is { tagger, message }, or null for a lightweight tag",
+            );
         }
-        "PUT" => {
-            let put: Put = body(request)?;
-            let Some(root) = put.root.filter(|root| is_commit_id(root)) else {
-                return fail(400, "root must name root's commit by its full id");
-            };
-            let annotation = put.annotation;
-            if !annotation.is_null() {
-                let tagger = annotation["tagger"].as_str();
-                if tagger.is_none() || !annotation["message"].is_string() {
-                    return fail(
-                        400,
-                        "annotation is { tagger, message }, or null for a lightweight tag",
-                    );
-                }
-                if tagger.is_some_and(|tagger| tagger.contains('\n') || !valid_tagger(tagger)) {
-                    return fail(
-                        400,
-                        "annotation.tagger is `Name <email> <seconds> <zone>`, as Git writes it",
-                    );
-                }
-            }
-            if let Some(existing) = db::tag(db, key, name)? {
-                if existing["list"]["root"] == root.as_str() && existing["annotation"] == annotation
-                {
-                    return ok(existing);
-                }
-                let at = existing["list"]["root"].as_str().unwrap_or_default();
-                return fail(
-                    409,
-                    format!(
-                        "tag `{name}` names root commit {} already, and a tag never moves: delete it first if it is wrong",
-                        &at[..at.len().min(12)]
-                    ),
-                );
-            }
-            let dir = project.tracker_dir("root");
-            let on_main = repos::branch_head(&dir, None, "main").is_some_and(|main| {
-                repos::has_commit(&dir, &root) && repos::is_ancestor(&dir, &root, &main)
-            });
-            if !on_main {
-                return fail(
-                    400,
-                    format!(
-                        "root commit {} is not on root's `main`: a tag names the project's history, so push the commit to `main` first (`git push origin main {name}`, or `git push --follow-tags`)",
-                        &root[..12]
-                    ),
-                );
-            }
-            let list = crate::merge::index_of(project, &root);
-            db::create_tag(db, key, name, &list, &annotation, &caller.login)?;
-            let made = db::tag(db, key, name)?.unwrap_or(Value::Null);
-            created(made)
+        if tagger.is_some_and(|tagger| tagger.contains('\n') || !valid_tagger(tagger)) {
+            return fail(
+                400,
+                "annotation.tagger is `Name <email> <seconds> <zone>`, as Git writes it",
+            );
         }
-        method => fail(404, format!("no route for {method} {}", request.path)),
     }
+    if let Some(existing) = db::tag(db, key, name)? {
+        if existing["list"]["root"] == root && existing["annotation"] == *annotation {
+            return Ok((existing, false));
+        }
+        let at = existing["list"]["root"].as_str().unwrap_or_default();
+        return fail(
+            409,
+            format!(
+                "tag `{name}` names root commit {} already, and a tag never moves: delete it first if it is wrong",
+                &at[..at.len().min(12)]
+            ),
+        );
+    }
+    let repo = project.tracker("root");
+    let on_main = repo
+        .branch_head("main")
+        .is_some_and(|main| repo.has_commit(root) && repo.is_ancestor(root, &main));
+    if !on_main {
+        return fail(
+            400,
+            format!(
+                "root commit {} is not on root's `main`: a tag names the project's history, so push the commit to `main` first (`git push origin main {name}`, or `git push --follow-tags`)",
+                &root[..root.len().min(12)]
+            ),
+        );
+    }
+    let list = crate::merge::index_of(project, root, None)?;
+    db::create_tag(db, key, name, &list, annotation, by)?;
+    tagged(project, &list);
+    Ok((db::tag(db, key, name)?.unwrap_or(Value::Null), true))
 }
 
 /// `Name <email> <seconds> <zone>`, as Git's `tagger` line has it.
@@ -1858,4 +2537,11 @@ fn valid_tagger(tagger: &str) -> bool {
         && zone.len() == 5
         && matches!(zone.as_bytes()[0], b'+' | b'-')
         && zone.bytes().skip(1).all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether pulls are moving: `/state` says a pull is stalled when its thread
+/// is gone, or has not stamped its beat for `mirror::STALLED_AFTER`.
+fn app_running(app: &App) -> bool {
+    let off = std::env::var("NEWGIT_SERVE_MIRRORS").is_ok_and(|value| value == "off");
+    off || app.mirrors.pulls_moving()
 }

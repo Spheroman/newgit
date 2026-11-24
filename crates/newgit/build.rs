@@ -72,7 +72,13 @@ fn packaged_commit() -> Option<String> {
 }
 
 fn git(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+    // git-locale: a build script cannot use `newgit_core::git::command()`;
+    // this is its one Git, in the same C locale.
+    let output = Command::new("git")
+        .env("LC_ALL", "C")
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

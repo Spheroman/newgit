@@ -21,14 +21,19 @@ pub enum RemoteCommand {
         /// The remote (default: https://newgit.dev)
         #[arg(long)]
         url: Option<String>,
-        /// The project's name on the remote (default: [project] name)
+        /// The project on the remote: a name creates `<you>/<name>`, and
+        /// `<owner>/<name>` joins a project you are a member of (default:
+        /// [project] name)
         #[arg(long)]
         project: Option<String>,
+        /// Print the result as JSON
         #[arg(long)]
         json: bool,
     },
-    /// Show the remote this project syncs to, and its members
+    /// Show the remote this project syncs to, its members, and what the
+    /// remote has not caught up on yet (roll-ups, webhook pulls)
     Show {
+        /// Print it as JSON
         #[arg(long)]
         json: bool,
     },
@@ -38,6 +43,7 @@ pub enum RemoteCommand {
     Delete {
         /// The project's `<owner>/<name>`, typed out to confirm
         project: String,
+        /// Print the result as JSON
         #[arg(long)]
         json: bool,
     },
@@ -49,8 +55,13 @@ pub enum MembersCommand {
     Add { login: String },
     /// Take a GitHub user's access away
     Remove { login: String },
+    /// Encrypt every shared tracker outside Git again, to the members as
+    /// they are now: what `add` and `remove` do, run again after one of
+    /// them could not (offline, or a member has since added a key)
+    Reencrypt,
     /// List the project's members
     List {
+        /// Print them as JSON
         #[arg(long)]
         json: bool,
     },
@@ -210,7 +221,11 @@ fn add(url: Option<String>, project: Option<String>, json: bool) -> Result<()> {
         project: Some(key.clone()),
     });
     store.write_config(&config)?;
-    BranchManager::open(store.clone())?.route_project_root()?;
+    let manager = BranchManager::open(store.clone())?;
+    // A project linked again (another remote, or one made again under the
+    // same name) has none of what this machine sent before.
+    manager.forget_what_the_remote_has()?;
+    manager.route_project_root()?;
 
     if json {
         println!(
@@ -348,7 +363,7 @@ fn fetch_project(
     full: bool,
 ) -> Result<Fetched> {
     let git = |args: &[&str]| -> Result<String> {
-        let output = std::process::Command::new("git")
+        let output = newgit_core::git::command()
             .arg("-C")
             .arg(dir.as_str())
             .args(args)
@@ -401,7 +416,7 @@ fn fetch_project(
             Some(&remote::basic_auth_header(&credential)),
         )?;
         // The list is the truth for where `main` is.
-        let output = std::process::Command::new("git")
+        let output = newgit_core::git::command()
             .arg(format!("--git-dir={}", paths.tracker_store))
             .args([
                 "update-ref",
@@ -483,7 +498,7 @@ fn fetch_project(
     ])?;
     let definitions = dir.join(".newgit/trackers");
     std::fs::create_dir_all(&definitions)?;
-    let archive = std::process::Command::new("git")
+    let archive = newgit_core::git::command()
         .arg("-C")
         .arg(dir.as_str())
         .args([
@@ -533,14 +548,14 @@ pub fn init_named_project(root: &camino::Utf8Path, url: &str, key: &str) -> Resu
     let url = url.trim_end_matches('/');
     let store = MetadataStore::at(root);
     let local_git = |args: &[&str]| {
-        std::process::Command::new("git")
+        newgit_core::git::command()
             .arg("-C")
             .arg(root.as_str())
             .args(args)
             .output()
             .context("could not run git")
     };
-    let seeded = std::process::Command::new("git")
+    let seeded = newgit_core::git::command()
         .arg(format!("--git-dir={}", store.paths().tracker_store))
         .args(["rev-parse", "-q", "--verify", "refs/trackers/root/main"])
         .output()
@@ -678,7 +693,7 @@ fn join_from(
     // nothing. Anything else is only here.
     let at_origin = format!("refs/remotes/origin/{branch}");
     let in_root = |args: &[&str]| {
-        std::process::Command::new("git")
+        newgit_core::git::command()
             .arg("-C")
             .arg(root.as_str())
             .args(args)
@@ -716,7 +731,7 @@ fn join_from(
     let tracked = in_root(&["ls-files", "-z"])?;
     let tracked: std::collections::BTreeSet<&[u8]> =
         tracked.stdout.split(|byte| *byte == 0).collect();
-    let tree = std::process::Command::new("git")
+    let tree = newgit_core::git::command()
         .arg("-C")
         .arg(scratch.as_str())
         .args(["ls-tree", "-r", "-z", &fetched.head])
@@ -761,7 +776,7 @@ fn join_from(
     }
 
     let git = |location: &[&str], args: &[&str]| -> Result<()> {
-        let output = std::process::Command::new("git")
+        let output = newgit_core::git::command()
             .args(location)
             .args(args)
             .output()
@@ -963,6 +978,7 @@ fn delete(confirm: &str, json: bool) -> Result<()> {
     }
     let repos = client.delete_project(&name)?;
     let store = context.store;
+    BranchManager::open(store.clone())?.forget_what_the_remote_has()?;
     let mut config = store.load_config()?;
     config.remote = None;
     store.write_config(&config)?;
@@ -991,21 +1007,58 @@ pub fn members(command: MembersCommand) -> Result<()> {
     match command {
         MembersCommand::Add { login } => {
             let login = login.to_lowercase();
+            let manager = manager_here()?;
             if client.add_member(&name, &login)? {
                 println!("{login} can now use `{name}`");
             } else {
                 println!("{login} was already a member of `{name}`");
             }
+            let encrypted = manager.encrypted_trackers();
+            if !encrypted.is_empty() {
+                match manager.usable_keys(&login) {
+                    Ok(keys) if keys.is_empty() => println!(
+                        "  WARNING: {login} has no ssh-ed25519 or ssh-rsa key at \
+                         https://github.com/{login}.keys, so they cannot decrypt {}, which {} \
+                         encrypted to the project's members. Once they add one, run `newgit \
+                         members reencrypt`",
+                        tracker_list(&encrypted),
+                        if encrypted.len() == 1 { "is" } else { "are" },
+                    ),
+                    Ok(_) => {}
+                    Err(error) => println!("  WARNING: could not read {login}'s keys: {error}"),
+                }
+                reencrypt(&manager)?;
+            }
         }
         MembersCommand::Remove { login } => {
             let login = login.to_lowercase();
+            let manager = manager_here()?;
             if client.remove_member(&name, &login)? {
                 println!("{login} no longer has access to `{name}`");
                 println!(
                     "  their newgit tokens stop working here at once; Git passwords they hold expire within 15 minutes"
                 );
+                let encrypted = manager.encrypted_trackers();
+                if !encrypted.is_empty() {
+                    // Said whatever the re-encryption does: it is true either way.
+                    println!(
+                        "  ROTATE: {login} can still read everything they could read before: every \
+                         rev of {} encrypted while they were a member, and whatever they copied. \
+                         Change those secrets wherever they are used",
+                        tracker_list(&encrypted),
+                    );
+                    reencrypt(&manager)?;
+                }
             } else {
                 println!("{login} was not a member of `{name}`");
+            }
+        }
+        MembersCommand::Reencrypt => {
+            let manager = manager_here()?;
+            if manager.encrypted_trackers().is_empty() {
+                println!("no tracker of `{name}` is encrypted to its audience");
+            } else {
+                reencrypt(&manager)?;
             }
         }
         MembersCommand::List { json } => {
@@ -1031,6 +1084,73 @@ pub fn members(command: MembersCommand) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn manager_here() -> Result<BranchManager> {
+    let context = MetadataStore::discover(&crate::current_dir()?)?;
+    Ok(BranchManager::open(context.store)?)
+}
+
+fn tracker_list(trackers: &[String]) -> String {
+    trackers
+        .iter()
+        .map(|tracker| format!("`{}`", newgit_core::tracker::tracker_path(tracker)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Encrypt each shared tracker's `main` again, and say what happened: who
+/// each is encrypted to, by key fingerprint, and loudly when that is not
+/// the set this machine last used. Fails, after saying which trackers were
+/// and were not re-encrypted, when any one was not: the membership change
+/// itself already happened, and `newgit members reencrypt` retries.
+fn reencrypt(manager: &BranchManager) -> Result<()> {
+    let mut failed = Vec::new();
+    let mut done = Vec::new();
+    for outcome in manager.reencrypt_for_audience() {
+        let tracker = newgit_core::tracker::tracker_path(&outcome.tracker);
+        if let Some(error) = &outcome.error {
+            println!("  `{tracker}`: NOT re-encrypted: {error}");
+            failed.push(format!("`{tracker}`"));
+            continue;
+        }
+        match &outcome.rev {
+            _ if !outcome.merged => {
+                println!("  `{tracker}`: nothing merged yet, so nothing to re-encrypt");
+            }
+            Some(rev) => println!("  `{tracker}`: main re-encrypted at {rev}"),
+            None => println!("  `{tracker}`: main is already encrypted to these keys"),
+        }
+        done.push(format!("`{tracker}`"));
+        println!(
+            "{}",
+            newgit_core::manager::describe_recipients(
+                &tracker,
+                &outcome.recipients,
+                outcome.previous.as_ref()
+            )
+        );
+        if !outcome.keyless.is_empty() {
+            println!(
+                "    WARNING: {} cannot decrypt it: no ssh-ed25519 or ssh-rsa key on GitHub",
+                outcome.keyless.join(", ")
+            );
+        }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "not every encrypted tracker was re-encrypted. Re-encrypted: {}. NOT re-encrypted \
+             (their `main` on the remote is still encrypted to whoever it was before): {}. \
+             `newgit members reencrypt` retries",
+            if done.is_empty() {
+                "none".to_owned()
+            } else {
+                done.join(", ")
+            },
+            failed.join(", ")
+        );
     }
     Ok(())
 }

@@ -13,8 +13,18 @@ readme = "../../README.md"
 workspace = true
 
 [dependencies]
+# Encrypting trackers outside Git to their audience (#338): age, to the
+# members' GitHub SSH keys; base64 for key fingerprints and age's key tags;
+# rpassword to ask for an SSH key's passphrase.
+age = { version = "0.12", features = ["ssh"] }
+base64 = "0.23"
+# Reading hook commands as shell (#87): a real POSIX/bash parser, not a
+# tokenizer of our own.
+brush-parser = "0.4"
 camino = { version = "1.2", features = ["serde1"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# Loose objects are zlib streams (objects.rs writes them in process).
+flate2 = "1"
 # Process-group signalling and reaping (see supervisor.rs), and low-level
 # socket options (see ports.rs: the port-bind probe needs SO_REUSEADDR
 # off, which std's TcpListener does not expose).
@@ -25,6 +35,7 @@ nix = { version = "0.31", features = ["signal", "process", "net", "fs"] }
 # The path scan reads every produced tree in full; one thread over 3.8 GB
 # took longer than the install it was vetting.
 rayon = "1"
+rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11"
@@ -32,7 +43,7 @@ sha2 = "0.11"
 tempfile = "3"
 thiserror = "2"
 toml = "1.1"
-ureq = { version = "3.4.2", features = ["json"] }
+ureq = { version = "3.4.2", features = ["json", "platform-verifier"] }
 
 # `clonefile(2)` on a whole directory tree (see installs.rs: `cp -c`
 # clones one file at a time, which is slower than the install it replaces).
@@ -40,4 +51,6 @@ ureq = { version = "3.4.2", features = ["json"] }
 reflink-copy = "0.1"
 
 [dev-dependencies]
+# `setrlimit`, for the test that a flush of many objects keeps few files open.
+nix = { version = "0.31", features = ["resource"] }
 tempfile = "3"
