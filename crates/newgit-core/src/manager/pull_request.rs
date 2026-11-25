@@ -2,12 +2,13 @@
 //! reviewer spawning it (#167, #170).
 //!
 //! A pull request names an instance, not a ref. Its head is the instance's
-//! latest checkpoint on the remote, read when asked, so a push moves it and
-//! each checkpoint is a revision. Checking one out is `spawn
-//! --from-checkpoint` on that head: the code, the trackers the reviewer may
-//! read (with their own per-user content), and the resources.
+//! latest push on the remote, read when asked, so a push moves it and each
+//! push is a revision. Checking one out is `spawn --from-checkpoint` on that
+//! head, from the remote: the code, the trackers the reviewer may read (with
+//! their own per-user content), and the resources.
 
 use super::{BranchManager, SpawnFromCheckpointOutcome};
+use crate::branch::branch_slug;
 use crate::error::{NewgitError, Result};
 use crate::remote::{Acting, NewPullRequest, RemotePull};
 use crate::source::{GitSource, run_git_env};
@@ -25,14 +26,16 @@ pub struct PullRequestSpec {
 }
 
 impl BranchManager {
-    /// Open a pull request for `instance`'s pushed work. Refused while its
-    /// workspace has commits the remote does not: what is proposed is what
-    /// was pushed, never something only this machine has.
+    /// Open a pull request for `instance`'s pushed work, and what to warn
+    /// about. Refused while its workspace has commits its last push did not:
+    /// what is proposed is what was pushed, never something only this
+    /// machine has. Uncommitted changes are warned about, not refused: the
+    /// pull request has them as the last push left them.
     pub fn create_pull_request(
         &self,
         instance: &str,
         spec: &PullRequestSpec,
-    ) -> Result<RemotePull> {
+    ) -> Result<(RemotePull, Vec<String>)> {
         let link = self.remote.as_ref().ok_or(NewgitError::NoRemote)?;
         let branch = self.store.find_branch(instance)?;
         let head = GitSource::workspace_head(&branch.workspace_path)?;
@@ -62,7 +65,7 @@ impl BranchManager {
         // As the workspace, as a push is: an agent holding only its
         // workspace's token may open one for its own instance.
         let remote = link.connect(Acting::Workspace(&branch.workspace_path))?;
-        remote.create_pull(
+        let pull = remote.create_pull(
             &link.project,
             &NewPullRequest {
                 instance: &branch.slug,
@@ -72,7 +75,25 @@ impl BranchManager {
                 draft: spec.draft,
                 head_rev: &head,
             },
-        )
+        )?;
+        let mut warnings = Vec::new();
+        let status = run_git_env(
+            &[
+                "-C",
+                branch.workspace_path.as_str(),
+                "--no-optional-locks",
+                "status",
+                "--porcelain",
+            ],
+            &[],
+        )?;
+        if !status.is_empty() {
+            warnings.push(format!(
+                "`{}` has uncommitted changes: pull request #{} has them as its last push left them; `git push` again to bring any made since",
+                branch.name, pull.number
+            ));
+        }
+        Ok((pull, warnings))
     }
 
     /// Pull request `number`, its body and head included.
@@ -89,7 +110,8 @@ impl BranchManager {
     }
 
     /// Spawn pull request `number`'s head here as instance `name` (default
-    /// `pr-<number>`): `spawn --from-checkpoint` on its latest checkpoint.
+    /// `pr-<number>`): `spawn --from-checkpoint` on its instance's latest
+    /// push, as the remote has it.
     pub fn checkout_pull_request(
         &self,
         number: u64,
@@ -108,7 +130,12 @@ impl BranchManager {
                 "an instance `{name}` exists here already: `newgit remove {name}` first, or pick another name with --name"
             )));
         }
-        let outcome = self.spawn_from_checkpoint(&name, &head.instance, &head.id)?;
+        // From the remote, always: checkpoint ids count per instance, so this
+        // machine may have a `feature/ckpt_003` of its own, which
+        // `spawn_from_checkpoint` would take first.
+        let outcome = self
+            .spawn_from_remote_checkpoint(&name, &branch_slug(&head.instance), &head.id)
+            .map_err(|error| self.half_built(&name, &head.checkpoint, error))?;
         Ok((pull, outcome))
     }
 }

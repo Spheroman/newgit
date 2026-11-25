@@ -73,10 +73,9 @@ accepts any login list, makes every logged-in user an admin of it.
                          (refs in reftable, never served)
   server.sqlite          tokens, projects, members, branches (heads), instances,
                          forks, checkpoints, tags, links, grants, and which
-                         store each tracker is in (tracker_stores), items (pull
-                         requests); lists and
-                         stores follow the landing log (landings_placed,
-                         landing_applied, landings_voided)
+                         store each tracker is in (tracker_stores), and pull
+                         requests (items); lists and stores follow the landing
+                         log (landings_placed, landing_applied, landings_voided)
   serve.lock             locked while a server runs: one per data directory
   token.key              the HMAC key tokens are signed with
   hooks/pre-receive      refuses refs outside a grant's prefix
@@ -1171,19 +1170,28 @@ Resolved loudly; each is reversible.
    the CLI says the remote has no pull requests yet. They live in `items`,
    one number sequence per project for pull requests and, later, issues
    (#161). **A pull request names an instance and a base branch, never a
-   commit:** its head is the instance's latest checkpoint, read when asked,
-   so a push moves it, each checkpoint is a revision, and the push path did
-   not change. One may be open per instance and branch. Opening one is
-   refused while the workspace's HEAD is not the instance's head on the
-   remote (unpushed commits) and for a private instance, which it would
-   reveal. `pr checkout` is `spawn --from-checkpoint` on the head. A merge
-   says which instance it lands (`instance` in the begin body), and the
-   landing's own transaction marks that instance's pull request against the
-   branch merged, so no moment shows the branch moved and the pull request
-   open. Removing the instance closes its pull requests. The merger's word
-   on which instance it is merging is taken as it is: merging needs the same
-   approvals whatever it says, and the worst a false name does is mark that
-   instance's pull request merged.
+   commit:** its head is the instance's latest *push*, read when asked, so a
+   push moves it, each push is a revision, and the push path did not
+   change. Never a `newgit checkpoint`, nor the one `undo` or `merge` takes
+   first, which reach the remote too: those are not what was proposed. The
+   item keeps when its instance was made, so an instance made later under
+   the same name is not its instance: the pull request has no head then.
+   One may be open per instance and branch. Opening one is refused while
+   the workspace's HEAD is not where the last push was (unpushed commits),
+   for a private instance, which it would reveal, and when the push has
+   nothing the branch does not. `pr checkout` spawns the head from the
+   remote, never a local checkpoint of the same id (ids count per instance,
+   so they repeat across machines). **The landing decides what merged, never
+   a client:** a pull request is merged by the landing that leaves every
+   commit of its head (one per tracker in Git) at or behind that tracker's
+   new head on its branch. So the author's `newgit merge`, a reviewer's
+   merge of `pr-N`, and a mirror's pull all mark it, and unrelated work
+   marks nothing. Which ones is worked out before the rows are written,
+   outside the db lock (an ancestry walk per tracker per open pull request
+   on a moved branch), and written in the landing's own transaction, only
+   if the head is still the push that was checked, so no moment shows the
+   branch moved and the pull request open. Removing the instance closes its
+   pull requests.
 
 ## Not yet
 

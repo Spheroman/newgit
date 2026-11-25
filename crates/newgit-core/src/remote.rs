@@ -176,7 +176,7 @@ pub struct RemotePull {
     pub author: String,
     #[serde(default)]
     pub agent: Option<String>,
-    /// The instance whose work it proposes; its latest checkpoint is the head.
+    /// The instance whose work it proposes; its latest push is the head.
     pub instance: String,
     /// The branch it proposes the work for.
     pub base_ref_name: String,
@@ -186,8 +186,8 @@ pub struct RemotePull {
     pub closed_at: Option<String>,
     #[serde(default)]
     pub merged_by: Option<String>,
-    /// The instance's latest checkpoint. Left out of lists; `None` once the
-    /// instance is gone.
+    /// The instance's latest push. Left out of lists; `None` once the
+    /// instance is gone, or another has its name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<PullHead>,
 }

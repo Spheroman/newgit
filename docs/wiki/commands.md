@@ -278,14 +278,17 @@ Remote:
   `newgit remove <name> --purge` to remove it before running it again
 - `newgit pr create [instance] [--base <branch>] [-t <title>] [-b <body> |
   -F <file>] [--draft] [--json]` — propose an instance's pushed work for a
-  branch. Its head is the instance's latest checkpoint, so it moves when the
+  branch. Its head is the instance's latest push, so it moves when the
   instance pushes again. Title and body default to the last commit's message.
-  Refused while the workspace has unpushed commits, and for a private
-  instance. `newgit merge` marks it merged as it lands. On `newgit serve` only
-  for now
+  Refused while the workspace has unpushed commits, for a private instance,
+  and when the push has nothing the branch does not; uncommitted changes are
+  warned about. It is marked merged by the landing that puts its head on the
+  branch, whoever merges (the author's instance, or a reviewer's `pr-N`). On
+  `newgit serve` only for now
 - `newgit pr checkout <number> [--name <instance>] [--json]` — `spawn
-  --from-checkpoint` on a pull request's head: its code, uncommitted work, the
-  trackers you may read, and its resources, as instance `pr-<number>`
+  --from-checkpoint` on a pull request's head, always from the remote: its
+  code, uncommitted work, the trackers you may read, and its resources, as
+  instance `pr-<number>`
 - `newgit pr list [--state open|closed|merged|all] [-L <n>] [--json]`
 
 Resource templates: `process`, `pnpm`, `install`, `postgres`,

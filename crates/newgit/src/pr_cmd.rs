@@ -12,14 +12,16 @@ pub enum PrCommand {
     /// Propose an instance's pushed work for a branch
     ///
     /// The pull request names the instance, not a commit: its head is the
-    /// instance's latest checkpoint on the remote, so it moves each time the
-    /// instance pushes, and each push is a revision. Uncommitted work goes
-    /// in as the last push left it. Refused while the workspace has commits
-    /// the remote does not (push first), and for a private instance, which a
-    /// pull request would show to the project. Title and body default to the
-    /// workspace's last commit message, as `gh pr create --fill` does.
-    /// Merging stays `newgit merge`, which marks the pull request merged as
-    /// it lands.
+    /// instance's latest push, so it moves each time the instance pushes,
+    /// and each push is a revision. Uncommitted work goes in as the last
+    /// push left it (a warning says when there is some). Refused while the
+    /// workspace has commits its last push did not (push first), for a
+    /// private instance, which a pull request would show to the project, and
+    /// when the push has nothing the branch does not. Title and body default
+    /// to the workspace's last commit message, as `gh pr create --fill` does.
+    /// Merging stays `newgit merge`: the landing that puts the head on the
+    /// branch marks the pull request merged, whoever merges it (the
+    /// instance, or a reviewer's `pr-<number>`).
     Create {
         /// Instance (inferred when run inside a workspace)
         instance: Option<String>,
@@ -45,7 +47,8 @@ pub enum PrCommand {
     },
     /// Spawn a pull request's head here, environment and all
     ///
-    /// `spawn --from-checkpoint` on the pull request's latest checkpoint: its
+    /// `spawn --from-checkpoint` on the pull request's latest push, from the
+    /// remote even when this machine has a checkpoint of the same id: its
     /// code (uncommitted work included), the trackers you may read, with
     /// your own content for per-user ones, and its resources, a database
     /// restored from the checkpoint's dump among them, on ports of this
@@ -142,7 +145,7 @@ fn create(
         None => body,
     };
     let (manager, instance) = crate::manager_and_instance(instance)?;
-    let pull = manager.create_pull_request(
+    let (pull, warnings) = manager.create_pull_request(
         &instance,
         &PullRequestSpec {
             base,
@@ -151,6 +154,7 @@ fn create(
             draft,
         },
     )?;
+    crate::print_warnings(&warnings);
     if json {
         println!("{}", serde_json::to_string(&pull)?);
         return Ok(());

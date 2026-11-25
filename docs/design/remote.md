@@ -130,7 +130,9 @@ definition (`.newgit/trackers/root.toml`).
 - Overlap reporting between live instances.
 - Previews, environment snapshots, and CI on push.
 - The web UI.
-- Forge features: pull requests, reviews, issues, checks, releases.
+- Forge features: reviews, issues, checks, releases. Pull requests (`newgit
+  pr create|checkout|list`) are on `newgit serve` only ([serve.md](serve.md),
+  decision 8).
 - CLI commands for things the API already does: by-hand agent tokens
   (create, list, revoke), and creating branches or changing the default one.
 - Resources that depend on a role. (Merge stacking by tracker, `merge
