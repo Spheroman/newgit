@@ -53,11 +53,11 @@ pub struct ApiResponse {
     pub body: Value,
 }
 
-fn ok(body: Value) -> ApiResult<ApiResponse> {
+pub(crate) fn ok(body: Value) -> ApiResult<ApiResponse> {
     Ok(ApiResponse { status: 200, body })
 }
 
-fn created(body: Value) -> ApiResult<ApiResponse> {
+pub(crate) fn created(body: Value) -> ApiResult<ApiResponse> {
     Ok(ApiResponse { status: 201, body })
 }
 
@@ -112,7 +112,7 @@ impl Caller {
     }
 }
 
-fn require_owner(owner: &str, login: &str, action: &str) -> ApiResult<()> {
+pub(crate) fn require_owner(owner: &str, login: &str, action: &str) -> ApiResult<()> {
     if owner != login {
         return fail(403, format!("only {owner} may {action}"));
     }
@@ -126,7 +126,7 @@ fn require_part(what: &str, value: &str) -> ApiResult<()> {
     }
 }
 
-fn body<T: DeserializeOwned>(request: &ApiRequest) -> ApiResult<T> {
+pub(crate) fn body<T: DeserializeOwned>(request: &ApiRequest) -> ApiResult<T> {
     let bytes: &[u8] = if request.body.is_empty() {
         b"{}"
     } else {
@@ -1211,10 +1211,14 @@ fn project_route(
             require_owner(&instance.owner, &login, &format!("remove `{name}`"))?;
             caller.require_not_instance("remove instances")?;
             remove_forks(&project, &instance)?;
+            db::close_pulls_of(&db, &key, name)?;
             db::delete_instance(&db, &key, name)?;
             db::revoke_pinned(&db, &key, Some(name))?;
             ok(json!({ "name": name, "removed": true }))
         }
+        ("POST", ["pulls"]) => crate::pulls::create(&project, &db, caller, request),
+        ("GET", ["pulls"]) => crate::pulls::list(&project, &db, &login, request),
+        ("GET", ["pulls", number]) => crate::pulls::view(&project, &db, &login, number),
         ("GET", ["tags"]) => ok(json!({ "tags": db::tags(&db, &key)? })),
         (_, ["tags", ..]) => {
             // A tag's name may hold `/`: everything after `tags/`.

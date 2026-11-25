@@ -169,6 +169,9 @@ pub(super) fn apply_entries(
             }
         }
     }
+    // The pull requests these landings merge: read outside the db lock,
+    // written with the rows.
+    let merged = super::pulls::merged_by(app, entries, &acting);
     // 2. Refs, then rows, under the db lock.
     let mut skipped = Vec::new();
     {
@@ -253,7 +256,7 @@ pub(super) fn apply_entries(
         }
         log.fault("before-rows");
         db.execute_batch("PRAGMA synchronous = FULL")?;
-        let written = write_rows(&mut db, entries, &acting);
+        let written = write_rows(&mut db, entries, &acting, &merged);
         if let Err(error) = db.execute_batch("PRAGMA synchronous = NORMAL") {
             eprintln!("newgit serve: setting SQLite back to synchronous=NORMAL: {error}");
         }
@@ -330,12 +333,14 @@ pub(super) struct Chain {
     pub(super) moves: Vec<Skipped>,
 }
 
-/// Every row `entries` change, and each stamp marked in place (finished,
-/// unless storage is left to remove), in one SQLite transaction.
+/// Every row `entries` change, the pull requests they merge, and each stamp
+/// marked in place (finished, unless storage is left to remove), in one
+/// SQLite transaction.
 pub(super) fn write_rows(
     db: &mut Connection,
     entries: &[(Stamp, &Entry)],
     acting: &[BTreeSet<String>],
+    merged: &[super::pulls::Merged],
 ) -> ApiResult<()> {
     let transaction = db.transaction()?;
     for ((stamp, entry), here) in entries.iter().zip(acting) {
@@ -390,6 +395,10 @@ pub(super) fn write_rows(
                 db::set_voided(&transaction, *voided, *stamp, home)?;
             }
         }
+    }
+    // Only if each is still on the push that was checked.
+    for pull in merged {
+        db::merge_pull(&transaction, &pull.home, pull.number, &pull.head, &pull.by)?;
     }
     transaction.commit()?;
     Ok(())

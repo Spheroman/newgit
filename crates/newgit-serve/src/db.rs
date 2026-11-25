@@ -1,7 +1,8 @@
 //! Everything *about* history, in one SQLite database: what the Worker kept
 //! in its Durable Objects (users' tokens, each project's members, branches,
-//! instances, forks, checkpoints, tags, links), and which store each
-//! tracker's history is in.
+//! instances, forks, checkpoints, tags, links), which store each
+//! tracker's history is in, and the forge's items: pull requests today,
+//! issues later, one number sequence per project.
 //!
 //! Branches' lists (`heads`, `head_log`) and which store each tracker is in
 //! (`tracker_stores`) follow the landing log (`crate::landing`): they are
@@ -87,6 +88,15 @@ CREATE TABLE IF NOT EXISTS landings_placed (
 CREATE TABLE IF NOT EXISTS landings_voided (
     stamp INTEGER NOT NULL, by_stamp INTEGER NOT NULL, home TEXT NOT NULL,
     PRIMARY KEY (stamp, home));
+CREATE TABLE IF NOT EXISTS items (
+    home TEXT NOT NULL REFERENCES projects ON DELETE CASCADE, number INTEGER NOT NULL,
+    kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL, agent TEXT, state TEXT NOT NULL, draft INTEGER NOT NULL DEFAULT 0,
+    instance TEXT, instance_created TEXT, base TEXT, created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL, closed_at TEXT, merged_by TEXT, PRIMARY KEY (home, number));
+CREATE INDEX IF NOT EXISTS items_by_state ON items (home, kind, state, updated_at DESC, number DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS items_open_pull ON items (home, instance, base)
+    WHERE kind = 'pr' AND state = 'open';
 CREATE TABLE IF NOT EXISTS grants (
     repo TEXT NOT NULL, token_id TEXT NOT NULL, refs TEXT NOT NULL, expires_at INTEGER NOT NULL,
     PRIMARY KEY (repo, token_id, refs));
@@ -1068,6 +1078,225 @@ pub fn checkpoints(
     )?;
     let rows = statement.query_map(params![home, instance, viewer], checkpoint_row)?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+// ── Pull requests ─────────────────────────────────────────────────────────
+
+/// A pull request: an instance's work proposed for `base`. Its head is not
+/// stored; it is the instance's latest push, read when asked, so a push
+/// moves it and each push is a revision.
+#[derive(Debug, Clone)]
+pub struct Pull {
+    pub number: i64,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+    pub agent: Option<String>,
+    pub state: String,
+    pub draft: bool,
+    pub instance: String,
+    /// When the instance it was opened for was made: an instance made later
+    /// under the same name is another one, and not this pull request's.
+    pub instance_created: String,
+    pub base: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub merged_by: Option<String>,
+}
+
+impl Pull {
+    /// What a list shows: everything but the body. Field names follow `gh`'s
+    /// where the concept is the same.
+    pub fn summary(&self) -> Value {
+        json!({
+            "number": self.number, "title": self.title, "state": self.state,
+            "isDraft": self.draft, "author": self.author, "agent": self.agent,
+            "instance": self.instance, "baseRefName": self.base,
+            "createdAt": self.created_at, "updatedAt": self.updated_at,
+            "closedAt": self.closed_at, "mergedBy": self.merged_by,
+        })
+    }
+}
+
+fn pull_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pull> {
+    Ok(Pull {
+        number: row.get("number")?,
+        title: row.get("title")?,
+        body: row.get("body")?,
+        author: row.get("author")?,
+        agent: row.get("agent")?,
+        state: row.get("state")?,
+        draft: row.get::<_, i64>("draft")? != 0,
+        instance: row
+            .get::<_, Option<String>>("instance")?
+            .unwrap_or_default(),
+        instance_created: row
+            .get::<_, Option<String>>("instance_created")?
+            .unwrap_or_default(),
+        base: row.get::<_, Option<String>>("base")?.unwrap_or_default(),
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        closed_at: row.get("closed_at")?,
+        merged_by: row.get("merged_by")?,
+    })
+}
+
+/// What a new pull request says.
+pub struct NewPull<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+    pub author: &'a str,
+    pub agent: Option<&'a str>,
+    pub draft: bool,
+    pub instance: &'a Instance,
+    pub base: &'a str,
+}
+
+/// Open a pull request with the project's next number. `Err(number)` when
+/// the instance already has one open against `base`.
+///
+/// It reads, then writes: safe only because every request holds the one
+/// connection's lock (`Db::lock`) throughout, so no other write comes
+/// between. The unique index on open pull requests backs the first read.
+pub fn create_pull(db: &Connection, home: &str, new: &NewPull<'_>) -> ApiResult<Result<Pull, i64>> {
+    let open: Option<i64> = db
+        .query_row(
+            "SELECT number FROM items
+             WHERE home = ? AND kind = 'pr' AND state = 'open' AND instance = ? AND base = ?",
+            [home, &new.instance.name, new.base],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(number) = open {
+        return Ok(Err(number));
+    }
+    let number: i64 = db.query_row(
+        "SELECT COALESCE(MAX(number), 0) + 1 FROM items WHERE home = ?",
+        [home],
+        |row| row.get(0),
+    )?;
+    let now = now_iso();
+    db.execute(
+        "INSERT INTO items (home, number, kind, title, body, author, agent, state, draft,
+                            instance, instance_created, base, created_at, updated_at)
+         VALUES (?, ?, 'pr', ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)",
+        params![
+            home,
+            number,
+            new.title,
+            new.body,
+            new.author,
+            new.agent,
+            i64::from(new.draft),
+            new.instance.name,
+            new.instance.created_at,
+            new.base,
+            now,
+            now
+        ],
+    )?;
+    pull(db, home, number)?.map(Ok).ok_or_else(|| {
+        crate::error::HttpError::internal(format!(
+            "pull request #{number} was written and is not there"
+        ))
+    })
+}
+
+pub fn pull(db: &Connection, home: &str, number: i64) -> ApiResult<Option<Pull>> {
+    Ok(db
+        .query_row(
+            "SELECT * FROM items WHERE home = ? AND kind = 'pr' AND number = ?",
+            params![home, number],
+            pull_row,
+        )
+        .optional()?)
+}
+
+/// The instance `pull` was opened for, if it is still there: not another
+/// made since under its name.
+pub fn pull_instance(db: &Connection, home: &str, pull: &Pull) -> ApiResult<Option<Instance>> {
+    Ok(instance(db, home, &pull.instance)?
+        .filter(|instance| instance.created_at == pull.instance_created))
+}
+
+/// Pull requests in `state` (`None`: every state), most recently updated
+/// first, none on another user's private instance.
+pub fn pulls(
+    db: &Connection,
+    home: &str,
+    state: Option<&str>,
+    viewer: &str,
+    limit: usize,
+) -> ApiResult<Vec<Pull>> {
+    let mut statement = db.prepare(
+        "SELECT p.* FROM items p LEFT JOIN instances i ON i.home = p.home AND i.name = p.instance
+         WHERE p.home = ?1 AND p.kind = 'pr' AND (?2 IS NULL OR p.state = ?2)
+           AND (i.private IS NULL OR i.private = 0 OR i.owner = ?3)
+         ORDER BY p.updated_at DESC, p.number DESC LIMIT ?4",
+    )?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = statement.query_map(params![home, state, viewer, limit], pull_row)?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The pull requests open against `base`.
+pub fn open_pulls_on(db: &Connection, home: &str, base: &str) -> ApiResult<Vec<Pull>> {
+    let mut statement = db.prepare(
+        "SELECT * FROM items WHERE home = ? AND kind = 'pr' AND state = 'open' AND base = ?",
+    )?;
+    let rows = statement.query_map([home, base], pull_row)?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Mark pull request `number` merged by `by`, if it is still open, still on
+/// the instance it was opened for, and its head is still push `head`: what
+/// the landing found already on the branch. Called inside the landing's own
+/// transaction; a push since leaves it open.
+pub fn merge_pull(
+    db: &Connection,
+    home: &str,
+    number: i64,
+    head: &str,
+    by: &str,
+) -> ApiResult<bool> {
+    let now = now_iso();
+    Ok(db.execute(
+        "UPDATE items SET state = 'merged', merged_by = ?1, closed_at = ?2, updated_at = ?2
+         WHERE home = ?3 AND kind = 'pr' AND number = ?4 AND state = 'open'
+           AND EXISTS (SELECT 1 FROM instances i WHERE i.home = items.home
+                       AND i.name = items.instance AND i.created_at = items.instance_created)
+           AND (SELECT c.id FROM checkpoints c WHERE c.home = items.home
+                AND c.instance = items.instance AND json_extract(c.record, '$.reason') = 'push'
+                ORDER BY c.created_at DESC, c.id DESC LIMIT 1) = ?5",
+        params![by, now, home, number, head],
+    )? > 0)
+}
+
+/// Close every pull request `instance` has open: it is gone, so they have
+/// no head.
+pub fn close_pulls_of(db: &Connection, home: &str, instance: &str) -> ApiResult<usize> {
+    let now = now_iso();
+    Ok(db.execute(
+        "UPDATE items SET state = 'closed', closed_at = ?, updated_at = ?
+         WHERE home = ? AND kind = 'pr' AND state = 'open' AND instance = ?",
+        params![now, now, home, instance],
+    )?)
+}
+
+/// `instance`'s latest push: a pull request's head. Only a push, never the
+/// checkpoint `undo` or `merge` takes first, or a `newgit checkpoint`, which
+/// are uploaded too: those are not what was proposed.
+pub fn latest_push(db: &Connection, home: &str, instance: &str) -> ApiResult<Option<Value>> {
+    Ok(db
+        .query_row(
+            "SELECT * FROM checkpoints WHERE home = ? AND instance = ?
+               AND json_extract(record, '$.reason') = 'push'
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            [home, instance],
+            checkpoint_row,
+        )
+        .optional()?)
 }
 
 // ── Tags ──────────────────────────────────────────────────────────────────

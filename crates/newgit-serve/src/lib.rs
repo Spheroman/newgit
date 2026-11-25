@@ -16,6 +16,7 @@ pub mod migrate;
 pub mod mirror;
 pub mod names;
 pub mod policy;
+pub mod pulls;
 pub mod readers;
 pub mod reparent;
 pub mod repos;

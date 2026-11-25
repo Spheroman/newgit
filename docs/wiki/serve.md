@@ -158,6 +158,9 @@ What differs is the machinery, and it is the reason to run it:
   test's stand-in: `git = "https://github.example.com/"` at the top of the
   file.)
 
+Only here so far: pull requests (`newgit pr create`, `pr checkout`, `pr
+list`). newgit.dev answers that it has none yet.
+
 What it does not do yet:
 
 - The site: no landing page, no `/install.sh`, and no wiki at `/docs`.

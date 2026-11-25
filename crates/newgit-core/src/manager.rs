@@ -62,6 +62,8 @@ mod reset;
 mod run_logs;
 pub use reset::{HeldBack, ResetLine, ResetOutcome};
 use run_logs::{last_action_log, last_log_line};
+mod pull_request;
+pub use pull_request::PullRequestSpec;
 mod stale_render;
 pub use stale_render::{PossiblyStale, StaleRender};
 mod stale_definition;
